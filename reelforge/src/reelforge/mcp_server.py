@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Image, MCPServer
 
 from . import __version__
 from .captions import PRESETS as CAPTION_PRESETS
@@ -48,11 +48,14 @@ server = MCPServer(
     version=__version__,
     instructions=(
         "Edits footage into vertical video (Instagram Reels, TikTok, YouTube Shorts).\n\n"
-        "Two routes. For a single take that just needs tightening and verticalising, "
-        "call `autocut` then `render` — no transcript required. For multi-take work, "
-        "restructuring, or captions, call `transcribe` then `pack_takes`, read the "
-        "returned transcript, write an EDL with `write_edl`, then `lint_edl` and "
-        "`render`.\n\n"
+        "Three routes.\n"
+        "1. Existing footage, one take: `autocut` then `render`. No transcript needed.\n"
+        "2. Existing footage, multiple takes or captions wanted: `transcribe`, "
+        "`pack_takes`, read the returned transcript, `write_edl`, `lint_edl`, `render`.\n"
+        "3. No footage: `generate_asset` for images/video/speech/music, "
+        "`still_to_clip` for stills, then assemble as usual.\n\n"
+        "Use `timeline_view` to LOOK at footage when the transcript cannot settle a "
+        "question, and `review_cuts` on a render before showing it to the user.\n\n"
         "Always confirm the plan with the user before rendering. Always run "
         "`lint_edl` before a final render and report what it says."
     ),
@@ -158,11 +161,14 @@ async def list_capabilities() -> str:
                 "left": safe.left, "right": safe.right,
             },
         }
+    from .transitions import catalog as transition_catalog
+
     return json.dumps({
         "platforms": platforms,
         "caption_styles": sorted(CAPTION_PRESETS),
         "grades": list_grades(),
         "reframe_modes": ["track", "static", "center", "blur_pad", "fit"],
+        "transitions": transition_catalog(),
         "qualities": sorted(QUALITY),
     }, indent=2)
 
@@ -435,6 +441,191 @@ async def render(
         ],
         "size_mb": round(result.output.stat().st_size / (1024 * 1024), 2),
         "next": "call lint_edl with rendered=<output> to verify the finished file",
+    }, indent=2)
+
+
+# --- Visual drill-down ------------------------------------------------------
+
+
+@server.tool(
+    description=(
+        "LOOK at a time range: returns a PNG of evenly spaced frames with "
+        "timestamps burned in, over the waveform for the same range. Use it at "
+        "decision points the transcript cannot settle — did the subject stay in "
+        "frame, is there a flash at this cut, which take is framed better, did "
+        "the reframe hold. It is a drill-down, not a scan: sampling a whole "
+        "timeline this way is slow and mostly shows nothing."
+    ),
+    # Returns image content, which has no meaningful JSON output schema; the
+    # SDK derives one from the return annotation otherwise, and Image is not
+    # a type pydantic can build a schema for.
+    structured_output=False,
+)
+async def timeline_view(
+    source: str,
+    start: float,
+    end: float,
+    directory: str = ".",
+    frames: int = 8,
+) -> Image:
+    from .timeline_view import timeline_view as make_view
+
+    root = _resolve_dir(directory)
+    src = _resolve_file(source, root)
+    out = _work(root) / "views" / f"{src.stem}_{start:.2f}_{end:.2f}.png"
+    view = await anyio.to_thread.run_sync(
+        lambda: make_view(src, start, end, out, frames=frames)
+    )
+    return Image(path=str(view.path))
+
+
+@server.tool(
+    description=(
+        "Self-review a rendered file at its cut boundaries. Renders one "
+        "filmstrip per seam (plus or minus a window) and returns them, so "
+        "flashes, jump cuts and lost subjects are visible rather than assumed. "
+        "Run this before showing a render to the user."
+    ),
+    # Returns image content, which has no meaningful JSON output schema; the
+    # SDK derives one from the return annotation otherwise, and Image is not
+    # a type pydantic can build a schema for.
+    structured_output=False,
+)
+async def review_cuts(
+    rendered: str,
+    edl_path: str = "edl.json",
+    directory: str = ".",
+    window: float = 1.2,
+    max_seams: int = 6,
+) -> list[Image | str]:
+    from .timeline_view import cut_boundaries
+    from .timeline_view import timeline_view as make_view
+
+    try:
+        root = _resolve_dir(directory)
+        video = _resolve_file(rendered, root)
+        edl = EDL.load(_resolve_file(edl_path, root))
+    except Exception as e:  # noqa: BLE001
+        return [_err(e)]
+
+    seams = cut_boundaries(edl, _work(root), window=window)
+    if not seams:
+        return ["single segment — no seams to review"]
+
+    out: list[Image | str] = []
+    shown = seams[:max_seams]
+    if len(seams) > len(shown):
+        out.append(f"{len(seams)} seams; showing the first {len(shown)}")
+    for i, (a, b) in enumerate(shown, start=1):
+        path = _work(root) / "views" / f"seam_{i:02d}.png"
+        try:
+            view = await anyio.to_thread.run_sync(
+                lambda a=a, b=b, path=path: make_view(video, a, b, path, frames=6)
+            )
+        except Exception as e:  # noqa: BLE001
+            out.append(f"seam {i} at {a:.2f}s could not be rendered: {e}")
+            continue
+        out.append(f"seam {i}: {a:.2f}s - {b:.2f}s")
+        out.append(Image(path=str(view.path)))
+    return out
+
+
+# --- Generation -------------------------------------------------------------
+
+
+@server.tool(
+    description=(
+        "List asset generation providers and whether each is usable right now. "
+        "Offline providers ('mock' placeholders, 'espeak' local speech) need no "
+        "key and always work; cloud providers need their API key in the "
+        "environment. Call this before promising generated footage."
+    )
+)
+async def list_generation_providers(kind: str | None = None) -> str:
+    from .generate import available_providers
+
+    return json.dumps(available_providers(kind), indent=2)  # type: ignore[arg-type]
+
+
+@server.tool(
+    description=(
+        "Generate an asset — image, video, speech or music — from a prompt. "
+        "provider 'auto' uses a cloud provider when its key is present and "
+        "falls back to an offline one, so this always produces a file; check "
+        "the returned provider to see which ran. Results are cached by request "
+        "hash, so repeating an identical prompt costs nothing. For speech the "
+        "returned duration is real and is what you should time picture against."
+    )
+)
+async def generate_asset(
+    kind: str,
+    prompt: str,
+    directory: str = ".",
+    duration: float = 4.0,
+    provider: str = "auto",
+    width: int = 1080,
+    height: int = 1920,
+    options: dict[str, Any] | None = None,
+) -> str:
+    from .generate import GenRequest, generate
+
+    try:
+        root = _resolve_dir(directory)
+        load_dotenv(root / ".env")
+        req = GenRequest(
+            kind=kind,  # type: ignore[arg-type]
+            prompt=prompt, duration=duration,
+            width=width, height=height, options=options or {},
+        )
+        asset = await anyio.to_thread.run_sync(
+            lambda: generate(req, _work(root), provider=provider)
+        )
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    return json.dumps({
+        "path": str(asset.path),
+        "kind": asset.kind,
+        "provider": asset.provider,
+        "duration_s": round(asset.duration, 3),
+        "cached": asset.cached,
+        "next": (
+            "for an image, call still_to_clip to make it usable on the timeline"
+            if asset.kind == "image" else
+            "reference this path from the EDL as a source, overlay or music track"
+        ),
+    }, indent=2)
+
+
+@server.tool(
+    description=(
+        "Turn a still image into a clip the timeline can use, with a slow push "
+        "applied by default. A motionless still in a feed reads as a loading "
+        "error; the drift is what makes it read as a shot."
+    )
+)
+async def still_to_clip(
+    image: str,
+    duration: float,
+    directory: str = ".",
+    output: str | None = None,
+    zoom: bool = True,
+) -> str:
+    from .generate import still_to_clip as make_clip
+
+    try:
+        root = _resolve_dir(directory)
+        src = _resolve_file(image, root)
+        out = root / (output or f"{src.stem}_clip.mp4")
+        path = await anyio.to_thread.run_sync(
+            lambda: make_clip(src, out, duration, zoom=zoom)
+        )
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+    return json.dumps({
+        "path": str(path),
+        "duration_s": duration,
+        "next": "add it to the EDL sources and reference it from a range",
     }, indent=2)
 
 

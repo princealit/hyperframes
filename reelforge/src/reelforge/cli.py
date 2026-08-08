@@ -305,6 +305,79 @@ def cmd_autocut(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_view(args: argparse.Namespace) -> int:
+    from .timeline_view import timeline_view
+
+    root = Path(args.directory).resolve()
+    source = Path(args.source)
+    source = source if source.is_absolute() else root / source
+    if not source.exists():
+        return _fail(f"source not found: {source}")
+
+    out = Path(args.output) if args.output else (
+        _work(root) / "views" / f"{source.stem}_{args.start:.2f}_{args.end:.2f}.png"
+    )
+    try:
+        view = timeline_view(source, args.start, args.end, out, frames=args.frames)
+    except Exception as e:  # noqa: BLE001
+        return _fail(str(e))
+
+    print(f"{view.path}  ({view.width}x{view.height}, {view.frames} frames"
+          f"{', waveform' if view.has_waveform else ''})")
+    return 0
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    from .generate import GenRequest, available_providers, generate
+
+    root = Path(args.directory).resolve()
+    load_dotenv(root / ".env")
+
+    if args.list_providers:
+        print(f"{'provider':<12}{'kinds':<26}{'offline':<9}{'usable':<8}requires")
+        for p in available_providers():
+            print(
+                f"{p['name']:<12}{','.join(p['kinds']):<26}"
+                f"{str(p['offline']):<9}{str(p['usable']):<8}{p['requires'] or '-'}"
+            )
+        return 0
+
+    if not args.prompt:
+        return _fail("a prompt is required (or pass --list-providers)")
+
+    try:
+        asset = generate(
+            GenRequest(kind=args.kind, prompt=args.prompt, duration=args.duration),
+            _work(root), provider=args.provider,
+        )
+    except Exception as e:  # noqa: BLE001
+        return _fail(str(e))
+
+    state = "cached" if asset.cached else "generated"
+    print(f"{asset.path}  ({asset.provider}, {asset.duration:.2f}s, {state})")
+    if asset.kind == "image":
+        print("  make it usable on the timeline: "
+              f"reelforge clip {asset.path} -t 3.0")
+    return 0
+
+
+def cmd_clip(args: argparse.Namespace) -> int:
+    from .generate import still_to_clip
+
+    root = Path(args.directory).resolve()
+    image = Path(args.image)
+    image = image if image.is_absolute() else root / image
+    if not image.exists():
+        return _fail(f"image not found: {image}")
+    out = Path(args.output) if args.output else root / f"{image.stem}_clip.mp4"
+    try:
+        path = still_to_clip(image, out, args.duration, zoom=not args.no_zoom)
+    except Exception as e:  # noqa: BLE001
+        return _fail(str(e))
+    print(f"{path}  ({args.duration:.2f}s)")
+    return 0
+
+
 def cmd_platforms(_: argparse.Namespace) -> int:
     print(f"{'key':<12}{'target':<24}{'canvas':<14}{'fps':<6}{'max':<8}sweet spot")
     for key, p in PLATFORMS.items():
@@ -317,6 +390,13 @@ def cmd_platforms(_: argparse.Namespace) -> int:
     print("grades:        ", ", ".join(list_grades()))
     print("reframe modes:  track, static, center, blur_pad, fit")
     print("quality:       ", ", ".join(QUALITY))
+
+    from .transitions import TRANSITIONS
+
+    print("\ntransitions")
+    for t in TRANSITIONS.values():
+        default = f"{t.default_duration:.2f}s" if t.default_duration else "-"
+        print(f"  {t.name:<12}{default:<8}{t.use.split('.')[0]}")
     return 0
 
 
@@ -452,6 +532,37 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--captions", action="store_true",
                     help="enable captions (needs a transcript)")
     sp.set_defaults(func=cmd_autocut)
+
+    sp = with_dir(sub.add_parser(
+        "view", help="filmstrip + waveform PNG for a time range"
+    ))
+    sp.add_argument("source")
+    sp.add_argument("start", type=float)
+    sp.add_argument("end", type=float)
+    sp.add_argument("-o", "--output")
+    sp.add_argument("-n", "--frames", type=int, default=8)
+    sp.set_defaults(func=cmd_view)
+
+    sp = with_dir(sub.add_parser(
+        "generate", help="generate an image, video, speech or music asset"
+    ))
+    sp.add_argument("prompt", nargs="?")
+    sp.add_argument("-k", "--kind", default="image",
+                    choices=("image", "video", "speech", "music"))
+    sp.add_argument("-t", "--duration", type=float, default=4.0)
+    sp.add_argument("--provider", default="auto",
+                    help="auto prefers a credentialled cloud provider, else offline")
+    sp.add_argument("--list-providers", action="store_true")
+    sp.set_defaults(func=cmd_generate)
+
+    sp = with_dir(sub.add_parser(
+        "clip", help="turn a still into a clip with a slow push"
+    ))
+    sp.add_argument("image")
+    sp.add_argument("-t", "--duration", type=float, default=3.0)
+    sp.add_argument("-o", "--output")
+    sp.add_argument("--no-zoom", action="store_true", help="hold the frame static")
+    sp.set_defaults(func=cmd_clip)
 
     sub.add_parser("platforms", help="list targets, styles and presets").set_defaults(
         func=cmd_platforms

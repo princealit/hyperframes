@@ -40,18 +40,73 @@ violations. It reports what to fix while fixing is still cheap.
 
 ## Scope — what is and isn't here
 
-reelforge is a complete **editor**. It is not a merge of all three projects, and
-the gap is worth stating plainly rather than discovering later.
+|                                       | status                                                                                                                                                                                                           |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **video-use** — the editing half      | Ported and extended, including `timeline_view`. Its automated three-pass self-eval loop is not ported; `review_cuts` gives an agent the same frames to judge from.                                               |
+| **OpenMontage** — the generation half | Image, video, speech and music generation behind a provider registry, with offline fallbacks. Not ported: avatar/lipsync, the 12-pipeline system, Backlot UI, Remotion composer, upscaling and face restoration. |
+| **HyperFrames**                       | Integrated as a bridge — scaffold, lint and render overlay slots. The 50+ registry blocks and motion-doctrine skills are not wrapped.                                                                            |
 
-|                                       | status                                                                                                                                                                          |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **video-use** — the editing half      | Ported and extended. Missing its `timeline_view` filmstrip drill-down and its automated self-eval loop.                                                                         |
-| **OpenMontage** — the generation half | **Not ported.** No AI video/image generation, no TTS, no music generation, no provider registry, no avatar/lipsync, no 12-pipeline system, no Backlot UI, no Remotion composer. |
-| **HyperFrames**                       | Integrated as a bridge — scaffold, lint and render overlay slots. The 50+ registry blocks and motion-doctrine skills are not wrapped.                                           |
+Footage in, edited vertical video out is complete and tested. Generation reaches
+far enough to build a video from nothing — stills, motion, narration and a music
+bed — but it is a thin provider layer, not OpenMontage's scored registry across
+a dozen vendors.
 
-So: footage in, edited vertical video out — that path is complete and tested.
-Text or a brief in, generated video out — that is OpenMontage's territory and is
-not built here. Most of OpenMontage is that second path.
+## Generation
+
+Four asset kinds behind one interface, cached by request hash so an identical
+prompt never bills or waits twice.
+
+```bash
+reelforge generate --list-providers
+reelforge generate "a lighthouse in fog" -k image
+reelforge generate "calm ambient bed" -k music -t 20
+reelforge clip .reelforge/assets/image_*/asset.png -t 3.0   # still -> moving shot
+```
+
+| provider     | kinds         | needs                                         |
+| ------------ | ------------- | --------------------------------------------- |
+| `replicate`  | image, video  | `REPLICATE_API_TOKEN` — FLUX, Kling, Veo      |
+| `openai`     | image, speech | `OPENAI_API_KEY`                              |
+| `elevenlabs` | speech, music | `ELEVENLABS_API_KEY`                          |
+| `espeak`     | speech        | nothing — local, robotic, **real durations**  |
+| `mock`       | all four      | nothing — deterministic labelled placeholders |
+
+`auto` prefers a credentialled cloud provider and falls back to offline, so a
+call always yields a file; the returned provider tells you which ran. The
+offline pair is what makes the generate-to-render path developable with nothing
+spent — assemble and time a rough cut on placeholders, then swap in real assets.
+
+A generated still needs `still_to_clip` before it belongs on a timeline. A
+motionless still in a feed reads as a loading error; the slow push is what makes
+it read as a shot.
+
+## Transitions
+
+Cuts are the default. Thirteen seam treatments when a cut isn't enough —
+`crossfade`, `dip_black`, `dip_white`, `whip_left`/`whip_right`, `blur`,
+`slide_left`/`slide_up`, `zoom`, `pixelize`, `circle`, `dissolve`.
+
+```json
+{ "source": "B", "start": 3.0, "end": 7.5, "transition": "crossfade", "transition_duration": 0.4 }
+```
+
+The seam belongs to the incoming clip, so `transition` describes how a range
+_enters_. **A transition consumes timeline time** — two 3s clips joined by a
+0.5s crossfade run 5.5s, not 6s — and every offset accounts for the overlap, so
+captions and overlays stay aligned across seams.
+
+## Looking at footage
+
+The transcript answers what was said and when. It cannot tell you whether the
+subject left frame or whether a cut flashes.
+
+```bash
+reelforge view take-01.mp4 12.0 18.0     # filmstrip + waveform PNG
+```
+
+Over MCP this comes back as an image the agent actually sees, and `review_cuts`
+renders one per seam of a finished file — a self-review pass before anything is
+shown to you.
 
 ## Install
 
@@ -124,22 +179,28 @@ Or in `claude_desktop_config.json` / `.mcp.json`:
 
 Then just talk to it: _"make this landscape clip into a Reel."_
 
-| tool                                          | does                                                    |
-| --------------------------------------------- | ------------------------------------------------------- |
-| `check_environment`                           | what this machine can actually do                       |
-| `probe_media`                                 | geometry, duration, whether it needs reframing          |
-| `list_capabilities`                           | platforms, safe zones, styles, grades                   |
-| `autocut`                                     | dead-air trim → EDL, no transcript needed               |
-| `transcribe`                                  | word-level ASR, cached                                  |
-| `pack_takes`                                  | **returns the transcript view inline** for cut planning |
-| `write_edl`                                   | validate and save an edit                               |
-| `lint_edl`                                    | **returns the retention report inline**                 |
-| `render`                                      | the full render pipeline                                |
-| `create_overlay_slot` / `render_overlay_slot` | HyperFrames motion graphics                             |
+| tool                                          | does                                                           |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| `check_environment`                           | what this machine can actually do                              |
+| `probe_media`                                 | geometry, duration, whether it needs reframing                 |
+| `list_capabilities`                           | platforms, safe zones, styles, grades, transitions             |
+| `autocut`                                     | dead-air trim → EDL, no transcript needed                      |
+| `transcribe`                                  | word-level ASR, cached                                         |
+| `pack_takes`                                  | **returns the transcript view inline** for cut planning        |
+| `write_edl`                                   | validate and save an edit                                      |
+| `lint_edl`                                    | **returns the retention report inline**                        |
+| `render`                                      | the full render pipeline                                       |
+| `timeline_view`                               | **returns a filmstrip + waveform image** — look at the footage |
+| `review_cuts`                                 | **one image per seam** of a render, for self-review            |
+| `generate_asset`                              | image / video / speech / music from a prompt                   |
+| `still_to_clip`                               | generated still → a shot with a slow push                      |
+| `list_generation_providers`                   | which providers are usable right now                           |
+| `create_overlay_slot` / `render_overlay_slot` | HyperFrames motion graphics                                    |
 
-The two reading tools return their content inline rather than writing a file —
-that is the point of the MCP surface, and the difference between an agent that
-can reason about a cut and one parsing stdout.
+The reading tools return their content inline rather than writing a file, and
+`timeline_view` / `review_cuts` return real images. That is the point of the MCP
+surface: an agent that can read the transcript, see the frames and judge its own
+cut, rather than one parsing stdout.
 
 Or drive it as a plain skill instead — see [`SKILL.md`](SKILL.md).
 

@@ -485,3 +485,257 @@ def test_overlay_outside_the_timeline_is_rejected(two_sources):
     )
     with pytest.raises(Exception):
         edl.validate(base_dir=two_sources)
+
+
+# --- transitions (real render) ----------------------------------------------
+
+
+def test_transitions_shorten_the_render_by_the_overlap(two_sources, tmp_path):
+    edl = EDL(
+        sources={"A": "A.mp4", "B": "B.mp4"},
+        ranges=[
+            Range(source="A", start=0.5, end=2.5, beat="HOOK"),
+            Range(source="B", start=0.5, end=2.5, transition="crossfade",
+                  transition_duration=0.6),
+            Range(source="A", start=2.5, end=4.5, transition="dip_black",
+                  transition_duration=0.5),
+        ],
+        platform="reels", reframe="center", captions=CaptionSpec(enabled=False),
+    )
+    # 6s of segments minus 1.1s of overlap.
+    assert edl.total_duration == pytest.approx(4.9)
+    out = tmp_path / "trans.mp4"
+    render(edl, out, quality="draft", base_dir=two_sources, verbose=False)
+    assert probe(out).duration == pytest.approx(4.9, abs=0.35)
+
+
+def test_crossfade_actually_blends_the_two_sources(two_sources, tmp_path):
+    edl = EDL(
+        sources={"A": "A.mp4", "B": "B.mp4"},
+        ranges=[
+            Range(source="A", start=0.5, end=2.5),
+            Range(source="B", start=0.5, end=2.5, transition="crossfade",
+                  transition_duration=0.6),
+        ],
+        platform="reels", reframe="center", captions=CaptionSpec(enabled=False),
+    )
+    out = tmp_path / "x.mp4"
+    render(edl, out, quality="final", base_dir=two_sources, verbose=False)
+
+    before = _mean_rgb(out, 0.8)     # A alone: blue
+    middle = _mean_rgb(out, 1.65)    # mid-seam
+    after = _mean_rgb(out, 2.3)      # B alone: red
+    # Mid-seam sits between the two, rather than being either one.
+    assert before[2] > before[0]
+    assert after[0] > after[2]
+    assert before[0] < middle[0] < after[0]
+
+
+def test_dip_black_actually_reaches_black(two_sources, tmp_path):
+    edl = EDL(
+        sources={"A": "A.mp4", "B": "B.mp4"},
+        ranges=[
+            Range(source="A", start=0.5, end=2.5),
+            Range(source="B", start=0.5, end=2.5, transition="dip_black",
+                  transition_duration=0.6),
+        ],
+        platform="reels", reframe="center", captions=CaptionSpec(enabled=False),
+    )
+    out = tmp_path / "dip.mp4"
+    render(edl, out, quality="final", base_dir=two_sources, verbose=False)
+
+    def luma(t):
+        raw = subprocess.run([
+            "ffmpeg", "-v", "error", "-ss", str(t), "-i", str(out),
+            "-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "-",
+        ], capture_output=True, check=True).stdout
+        return float(np.frombuffer(raw, dtype=np.uint8).mean())
+
+    # Seam spans 1.4 -> 2.0; the midpoint must be near black.
+    assert luma(1.0) > 40
+    assert luma(1.7) < 15
+    assert luma(2.3) > 40
+
+
+def test_captions_stay_aligned_across_a_transition(project, tmp_path):
+    """Transitions eat timeline time; caption offsets must account for it."""
+    plain = EDL(
+        sources={"A": "A.mp4"},
+        ranges=[Range(source="A", start=0.3, end=2.6), Range(source="A", start=3.0, end=5.9)],
+        platform="reels", detector="saliency",
+    )
+    faded = EDL(
+        sources={"A": "A.mp4"},
+        ranges=[
+            Range(source="A", start=0.3, end=2.6),
+            Range(source="A", start=3.0, end=5.9, transition="crossfade",
+                  transition_duration=0.5),
+        ],
+        platform="reels", detector="saliency",
+    )
+    # The second range starts half a second earlier once the seam overlaps.
+    assert faded.offsets()[1] == pytest.approx(plain.offsets()[1] - 0.5)
+
+    r = render(faded, tmp_path / "cap.mp4", quality="draft",
+               base_dir=project, verbose=False)
+    assert r.caption_cues > 0
+    assert probe(r.output).duration == pytest.approx(faded.total_duration, abs=0.35)
+
+
+# --- timeline_view ----------------------------------------------------------
+
+
+def test_timeline_view_renders_a_strip_over_a_waveform(moving_subject, tmp_path):
+    from reelforge.timeline_view import timeline_view
+
+    out = tmp_path / "view.png"
+    view = timeline_view(moving_subject, 0.0, 5.0, out, frames=8)
+    assert out.exists()
+    assert view.has_waveform
+    # Filmstrip plus waveform stacked, so it is wider than tall.
+    assert view.width > view.height
+    assert view.frames == 8
+
+
+def test_timeline_view_works_without_audio(tmp_path):
+    from reelforge.timeline_view import timeline_view
+
+    silent = tmp_path / "silent.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=#334455:s=640x360:d=4:r=30",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-an", str(silent),
+    ], check=True, capture_output=True)
+    view = timeline_view(silent, 0.0, 4.0, tmp_path / "v.png", frames=4)
+    assert view.path.exists()
+    assert view.has_waveform is False
+
+
+def test_timeline_view_rejects_an_empty_range(moving_subject, tmp_path):
+    from reelforge.timeline_view import timeline_view
+
+    with pytest.raises(ValueError, match="empty range"):
+        timeline_view(moving_subject, 3.0, 3.0, tmp_path / "x.png")
+
+
+def test_cut_boundaries_land_on_the_seams(two_sources):
+    from reelforge.timeline_view import cut_boundaries
+
+    edl = EDL(
+        sources={"A": "A.mp4"},
+        ranges=[Range(source="A", start=0, end=2),
+                Range(source="A", start=2, end=4),
+                Range(source="A", start=0, end=2)],
+    )
+    windows = cut_boundaries(edl, Path("."), window=1.0)
+    assert len(windows) == 2                       # one per seam, not per range
+    assert windows[0][0] < 2.0 < windows[0][1]
+
+
+# --- generation -------------------------------------------------------------
+
+
+def test_mock_provider_produces_usable_media(tmp_path):
+    from reelforge.generate import GenRequest, generate
+
+    work = tmp_path / ".reelforge"
+    img = generate(GenRequest("image", "a lone lighthouse"), work, provider="mock")
+    assert img.path.exists() and img.path.suffix == ".png"
+
+    vid = generate(GenRequest("video", "waves", duration=2.0), work, provider="mock")
+    assert probe(vid.path).duration == pytest.approx(2.0, abs=0.3)
+
+    mus = generate(GenRequest("music", "ambient", duration=3.0), work, provider="mock")
+    assert mus.duration == pytest.approx(3.0, abs=0.3)
+
+
+def test_generation_is_cached_by_request(tmp_path):
+    from reelforge.generate import GenRequest, generate
+
+    work = tmp_path / ".reelforge"
+    first = generate(GenRequest("image", "same prompt"), work, provider="mock")
+    second = generate(GenRequest("image", "same prompt"), work, provider="mock")
+    assert first.cached is False
+    assert second.cached is True
+    assert first.path == second.path
+
+
+def test_audio_only_assets_report_a_real_duration(tmp_path):
+    """Regression: probe() requires video, so audio durations read as 0.0."""
+    from reelforge.generate import GenRequest, generate
+
+    work = tmp_path / ".reelforge"
+    mus = generate(GenRequest("music", "bed", duration=4.0), work, provider="mock")
+    assert mus.duration > 1.0
+
+
+@pytest.mark.skipif(
+    shutil.which("espeak-ng") is None and shutil.which("espeak") is None,
+    reason="espeak not installed",
+)
+def test_espeak_produces_real_speech_with_a_real_duration(tmp_path):
+    from reelforge.generate import GenRequest, generate
+
+    work = tmp_path / ".reelforge"
+    short = generate(GenRequest("speech", "Hello."), work, provider="espeak")
+    long = generate(
+        GenRequest("speech", "This sentence is considerably longer than the other "
+                             "one and should therefore take more time to say."),
+        work, provider="espeak",
+    )
+    assert short.duration > 0.2
+    # Real synthesis, not an estimate: more words genuinely takes longer.
+    assert long.duration > short.duration * 2
+
+
+def test_still_becomes_a_moving_clip(tmp_path):
+    from reelforge.generate import GenRequest, generate, still_to_clip
+
+    work = tmp_path / ".reelforge"
+    img = generate(GenRequest("image", "a lighthouse"), work, provider="mock")
+    clip = still_to_clip(img.path, tmp_path / "clip.mp4", 3.0)
+    info = probe(clip)
+    assert info.duration == pytest.approx(3.0, abs=0.3)
+    assert (info.width, info.height) == (1080, 1920)
+
+    # The push means consecutive frames differ; a static still would not.
+    def frame(t):
+        raw = subprocess.run([
+            "ffmpeg", "-v", "error", "-ss", str(t), "-i", str(clip),
+            "-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "-",
+        ], capture_output=True, check=True).stdout
+        return np.frombuffer(raw, dtype=np.uint8).astype(int)
+
+    assert np.abs(frame(0.2) - frame(2.6)).mean() > 0.5
+
+
+def test_a_whole_video_can_be_built_from_generated_assets(tmp_path):
+    """No source footage at all: stills, music, transitions, render."""
+    from reelforge.generate import GenRequest, generate, still_to_clip
+
+    work = tmp_path / ".reelforge"
+    sources = {}
+    for i, prompt in enumerate(["a lighthouse", "dark rocks", "a calm sunrise"]):
+        img = generate(GenRequest("image", prompt), work, provider="mock")
+        still_to_clip(img.path, tmp_path / f"shot{i}.mp4", 2.0)
+        sources[f"S{i}"] = f"shot{i}.mp4"
+    music = generate(GenRequest("music", "ambient", duration=8.0), work, provider="mock")
+
+    edl = EDL(
+        sources=sources,
+        ranges=[
+            Range(source="S0", start=0, end=2.0, beat="HOOK"),
+            Range(source="S1", start=0, end=2.0, transition="crossfade"),
+            Range(source="S2", start=0, end=2.0, transition="dip_white"),
+        ],
+        platform="reels", reframe="center", music=str(music.path),
+        captions=CaptionSpec(enabled=False),
+    )
+    edl.validate(base_dir=tmp_path)
+    result = render(edl, tmp_path / "generated.mp4", quality="draft",
+                    base_dir=tmp_path, verbose=False)
+    info = probe(result.output)
+    assert info.height > info.width
+    assert info.has_audio
+    assert info.duration == pytest.approx(edl.total_duration, abs=0.4)

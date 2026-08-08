@@ -722,3 +722,180 @@ def test_keep_spans_handles_a_zero_length_clip():
     from reelforge.autocut import keep_spans
 
     assert keep_spans(0.0, []) == []
+
+
+# --- transitions ------------------------------------------------------------
+
+
+def test_transition_consumes_timeline_time():
+    # Two 3s clips joined by a 0.5s crossfade run 5.5s, not 6s. Getting this
+    # wrong drifts every caption and overlay after the seam.
+    from reelforge.transitions import timeline_offsets, total_duration
+
+    d, t = [3.0, 3.0], [0.0, 0.5]
+    assert total_duration(d, t) == pytest.approx(5.5)
+    assert timeline_offsets(d, t) == pytest.approx([0.0, 2.5])
+
+
+def test_offsets_accumulate_overlap_across_several_seams():
+    from reelforge.transitions import timeline_offsets, total_duration
+
+    d, t = [2.0, 2.0, 2.0], [0.0, 0.5, 0.5]
+    assert timeline_offsets(d, t) == pytest.approx([0.0, 1.5, 3.0])
+    assert total_duration(d, t) == pytest.approx(5.0)
+
+
+def test_cuts_consume_nothing():
+    from reelforge.transitions import timeline_offsets, total_duration
+
+    d, t = [2.0, 3.0], [0.0, 0.0]
+    assert total_duration(d, t) == pytest.approx(5.0)
+    assert timeline_offsets(d, t) == pytest.approx([0.0, 2.0])
+
+
+def test_transition_longer_than_its_neighbours_is_clamped():
+    # xfade reads `duration` from the tail of one clip and the head of the next;
+    # asking for more than either holds truncates the output.
+    from reelforge.transitions import clamp_durations
+
+    assert clamp_durations([1.0, 1.0], ["cut", "crossfade"], [0.0, 5.0]) == [0.0, 0.45]
+
+
+def test_first_range_never_carries_a_transition(tmp_path):
+    (tmp_path / "a.mp4").write_bytes(b"stub")
+    edl = EDL(
+        sources={"A": "a.mp4"},
+        ranges=[Range(source="A", start=0, end=3, transition="crossfade"),
+                Range(source="A", start=3, end=6)],
+        transition="dip_black",
+    )
+    # Nothing precedes the first range, so its seam is meaningless.
+    assert edl.transition_names()[0] == "cut"
+    assert edl.transition_durations()[0] == 0.0
+
+
+def test_range_transition_overrides_the_edl_default(tmp_path):
+    (tmp_path / "a.mp4").write_bytes(b"stub")
+    edl = EDL(
+        sources={"A": "a.mp4"},
+        ranges=[Range(source="A", start=0, end=3),
+                Range(source="A", start=3, end=6),
+                Range(source="A", start=6, end=9, transition="dip_black")],
+        transition="crossfade",
+    )
+    assert edl.transition_names() == ["cut", "crossfade", "dip_black"]
+
+
+def test_graph_uses_concat_for_cuts_and_xfade_for_transitions():
+    from reelforge.transitions import build_graph
+
+    graph, v, a = build_graph([2.0, 2.0, 2.0], ["cut", "cut", "crossfade"], [0, 0, 0.4])
+    assert "concat=n=2:v=1:a=0" in graph
+    assert "xfade=transition=fade" in graph
+    # The xfade offset is absolute on the output timeline: 4.0 - 0.4.
+    assert "offset=3.600" in graph
+
+
+def test_graph_of_a_single_segment_is_empty():
+    from reelforge.transitions import build_graph
+
+    graph, v, a = build_graph([3.0], ["cut"], [0.0])
+    assert graph == ""
+    assert v == "0:v"
+
+
+def test_unknown_transition_is_rejected():
+    from reelforge.transitions import get_transition
+
+    with pytest.raises(KeyError, match="crossfade"):
+        get_transition("crossfaed")
+
+
+def test_every_transition_maps_to_a_real_xfade_name():
+    from reelforge.transitions import CUT, TRANSITIONS
+
+    # These are ffmpeg's own transition names; a typo here fails only at render.
+    valid = {
+        "fade", "fadeblack", "fadewhite", "hlslice", "hrslice", "hblur",
+        "slideleft", "slideright", "slideup", "slidedown", "zoomin",
+        "pixelize", "circleopen", "circleclose", "dissolve", "wipeleft",
+        "wiperight", "wipeup", "wipedown", "radial", "smoothleft",
+    }
+    for name, t in TRANSITIONS.items():
+        if name == CUT:
+            continue
+        assert t.xfade in valid, f"{name} -> {t.xfade}"
+        assert t.use and t.default_duration > 0
+
+
+# --- generation -------------------------------------------------------------
+
+
+def test_request_hash_is_stable_and_prompt_sensitive():
+    from reelforge.generate import GenRequest
+
+    a = GenRequest("image", "a lighthouse")
+    b = GenRequest("image", "a lighthouse")
+    c = GenRequest("image", "a lighthouse at dusk")
+    d = GenRequest("image", "a lighthouse", options={"seed": 7})
+    assert a.key("mock") == b.key("mock")
+    assert a.key("mock") != c.key("mock")
+    # Options change the output, so they have to change the identity too.
+    assert a.key("mock") != d.key("mock")
+    # Provider is part of the identity: the same prompt on a different backend
+    # is a different asset.
+    assert a.key("mock") != a.key("replicate")
+
+
+def test_offline_providers_are_always_usable():
+    from reelforge.generate import available_providers
+
+    by_name = {p["name"]: p for p in available_providers()}
+    assert by_name["mock"]["usable"] is True
+    assert by_name["mock"]["offline"] is True
+
+
+def test_auto_falls_back_to_offline_without_credentials(monkeypatch):
+    from reelforge.generate import resolve_provider
+
+    for var in ("REPLICATE_API_TOKEN", "OPENAI_API_KEY", "ELEVENLABS_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    assert resolve_provider("image", "auto").offline is True
+    assert resolve_provider("video", "auto").name == "mock"
+
+
+def test_auto_prefers_a_credentialled_cloud_provider(monkeypatch):
+    from reelforge.generate import resolve_provider
+
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "test-token")
+    assert resolve_provider("image", "auto").name == "replicate"
+
+
+def test_naming_a_provider_without_its_key_fails_loudly(monkeypatch):
+    from reelforge.generate import GenerationError, resolve_provider
+
+    monkeypatch.delenv("REPLICATE_API_TOKEN", raising=False)
+    with pytest.raises(GenerationError, match="REPLICATE_API_TOKEN"):
+        resolve_provider("image", "replicate")
+
+
+def test_provider_rejects_a_kind_it_cannot_produce():
+    from reelforge.generate import GenerationError, resolve_provider
+
+    with pytest.raises(GenerationError, match="does not produce"):
+        resolve_provider("video", "espeak")
+
+
+def test_unknown_provider_lists_the_valid_ones():
+    from reelforge.generate import GenerationError, resolve_provider
+
+    with pytest.raises(GenerationError, match="mock"):
+        resolve_provider("image", "nope")
+
+
+def test_placeholder_colour_is_deterministic():
+    # A prompt must yield the same placeholder every run, or a rough cut
+    # reviewed with placeholders looks different on every rebuild.
+    from reelforge.generate import _placeholder_colour
+
+    assert _placeholder_colour("abc123") == _placeholder_colour("abc123")

@@ -12,6 +12,7 @@ import json
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -162,3 +163,133 @@ async def test_full_edit_over_mcp(tmp_path):
             out_w, out_h = (int(v) for v in rendered["size"].split("x"))
             assert out_h > out_w, "MCP render must produce a vertical file"
             assert (tmp_path / "out.mp4").exists()
+
+
+# --- the new tool surface ---------------------------------------------------
+
+
+async def _content(session: ClientSession, name: str, **kwargs):
+    return (await session.call_tool(name, kwargs)).content
+
+
+async def test_new_tools_are_advertised():
+    async with stdio_client(_params()) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = {t.name for t in (await session.list_tools()).tools}
+            assert {
+                "timeline_view", "review_cuts",
+                "generate_asset", "still_to_clip", "list_generation_providers",
+            } <= tools
+
+
+async def test_capabilities_include_transitions():
+    async with stdio_client(_params()) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            data = json.loads(await _call(session, "list_capabilities"))
+            names = {t["name"] for t in data["transitions"]}
+            assert {"cut", "crossfade", "dip_black", "whip_left"} <= names
+            for t in data["transitions"]:
+                assert t["use"], f"{t['name']} has no stated use"
+
+
+async def test_generation_providers_report_offline_availability():
+    async with stdio_client(_params()) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            providers = json.loads(await _call(session, "list_generation_providers"))
+            by_name = {p["name"]: p for p in providers}
+            # Offline providers must be usable with no key configured.
+            assert by_name["mock"]["usable"] is True
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+async def test_generate_and_clip_over_mcp(tmp_path):
+    async with stdio_client(_params(cwd=tmp_path)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            d = str(tmp_path)
+
+            asset = json.loads(await _call(
+                session, "generate_asset", kind="image",
+                prompt="a lighthouse in fog", directory=d, provider="mock",
+            ))
+            assert asset["provider"] == "mock"
+            assert Path(asset["path"]).exists()
+
+            clip = json.loads(await _call(
+                session, "still_to_clip", image=asset["path"],
+                duration=2.0, directory=d,
+            ))
+            assert Path(clip["path"]).exists()
+
+            # Music is audio-only; its duration must still come back real.
+            music = json.loads(await _call(
+                session, "generate_asset", kind="music", prompt="ambient bed",
+                duration=3.0, directory=d, provider="mock",
+            ))
+            assert music["duration_s"] > 1.0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+async def test_timeline_view_returns_an_actual_image(tmp_path):
+    source = tmp_path / "clip.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=#203040:s=1280x720:d=5:r=30",
+        "-f", "lavfi", "-i", "sine=frequency=300:duration=5",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest", str(source),
+    ], check=True, capture_output=True)
+
+    async with stdio_client(_params(cwd=tmp_path)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            content = await _content(
+                session, "timeline_view", source="clip.mp4",
+                start=0.0, end=4.0, directory=str(tmp_path), frames=6,
+            )
+            # The point of this tool is that the agent SEES the frames, so it
+            # must come back as image content and not a path in a string.
+            kinds = {getattr(c, "type", None) for c in content}
+            assert "image" in kinds
+            image = next(c for c in content if getattr(c, "type", None) == "image")
+            assert image.mime_type.startswith("image/")
+            assert len(image.data) > 500
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+async def test_review_cuts_returns_one_image_per_seam(tmp_path):
+    source = tmp_path / "clip.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=#402030:s=1280x720:d=9:r=30",
+        "-f", "lavfi", "-i", "sine=frequency=280:duration=9",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest", str(source),
+    ], check=True, capture_output=True)
+
+    async with stdio_client(_params(cwd=tmp_path)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            d = str(tmp_path)
+            edl = json.dumps({
+                "platform": "reels", "reframe": "center",
+                "sources": {"A": "clip.mp4"},
+                "ranges": [
+                    {"source": "A", "start": 0.0, "end": 2.5, "beat": "HOOK"},
+                    {"source": "A", "start": 3.0, "end": 5.5},
+                    {"source": "A", "start": 6.0, "end": 8.5},
+                ],
+                "captions": {"enabled": False},
+            })
+            await _call(session, "write_edl", edl_json=edl, directory=d)
+            await _call(session, "render", edl_path="edl.json", directory=d,
+                        output="out.mp4", quality="draft", captions=False)
+
+            content = await _content(session, "review_cuts", rendered="out.mp4",
+                                     edl_path="edl.json", directory=d)
+            images = [c for c in content if getattr(c, "type", None) == "image"]
+            # Three ranges means two seams.
+            assert len(images) == 2

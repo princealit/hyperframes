@@ -59,6 +59,11 @@ class Range:
     grade: str | None = None
     #: Playback rate. >1 tightens a slow passage without recutting it.
     speed: float = 1.0
+    #: How this range *enters* from the one before it. The seam belongs to the
+    #: incoming clip, so the first range's value is always ignored.
+    transition: str | None = None
+    #: Seam length in seconds. None takes the transition's own default.
+    transition_duration: float | None = None
 
     @property
     def duration(self) -> float:
@@ -132,6 +137,8 @@ class EDL:
     ranges: list[Range]
     platform: str = "reels"
     version: int = SCHEMA_VERSION
+    #: Default seam treatment between ranges; individual ranges may override.
+    transition: str = "cut"
     #: Default reframe mode; individual ranges may override.
     reframe: str = "track"
     #: Face/saliency/centre/auto. Applies to every tracked range.
@@ -153,22 +160,51 @@ class EDL:
         return get_platform(self.platform)
 
     @property
+    def segment_durations(self) -> list[float]:
+        return [r.duration for r in self.ranges]
+
+    def transition_names(self) -> list[str]:
+        """Seam treatment entering each range. Index 0 is always a cut."""
+        from .transitions import CUT
+
+        return [
+            CUT if i == 0 else (r.transition or self.transition)
+            for i, r in enumerate(self.ranges)
+        ]
+
+    def transition_durations(self) -> list[float]:
+        """Resolved, clamped seam lengths, aligned with `ranges`."""
+        from .transitions import clamp_durations, resolve_duration
+
+        names = self.transition_names()
+        raw = [
+            resolve_duration(name, r.transition_duration)
+            for name, r in zip(names, self.ranges)
+        ]
+        return clamp_durations(self.segment_durations, names, raw)
+
+    @property
+    def has_transitions(self) -> bool:
+        return any(d > 0 for d in self.transition_durations())
+
+    @property
     def total_duration(self) -> float:
-        return sum(r.duration for r in self.ranges)
+        from .transitions import total_duration
+
+        return total_duration(self.segment_durations, self.transition_durations())
 
     def offsets(self) -> list[float]:
         """Output-timeline start time of each range.
 
         Every timing conversion in the renderer and the caption builder keys off
         this. Getting it wrong is the classic cause of captions that drift
-        further out of sync with each successive cut.
+        further out of sync with each successive cut — and transitions make that
+        easy to get wrong, because a seam *overlaps* its neighbours and so the
+        timeline is shorter than the sum of its segments.
         """
-        out: list[float] = []
-        t = 0.0
-        for r in self.ranges:
-            out.append(t)
-            t += r.duration
-        return out
+        from .transitions import timeline_offsets
+
+        return timeline_offsets(self.segment_durations, self.transition_durations())
 
     def reframe_for(self, r: Range) -> str:
         return r.reframe or self.reframe
@@ -185,6 +221,7 @@ class EDL:
             "title": self.title,
             "intent": self.intent,
             "sources": dict(self.sources),
+            "transition": self.transition,
             "reframe": self.reframe,
             "detector": self.detector,
             "grade": self.grade,
@@ -228,6 +265,7 @@ class EDL:
             ranges=ranges,
             platform=data.get("platform", "reels"),
             version=int(data.get("version", SCHEMA_VERSION)),
+            transition=data.get("transition", "cut"),
             reframe=data.get("reframe", "track"),
             detector=data.get("detector", "auto"),
             grade=data.get("grade", "none"),
@@ -301,6 +339,16 @@ class EDL:
                 problems.append(
                     f"{tag} is only {r.source_duration * 1000:.0f}ms — likely a mistake"
                 )
+            name = r.transition or (self.transition if i else None)
+            if name is not None:
+                try:
+                    from .transitions import get_transition
+
+                    get_transition(name)
+                except KeyError as e:
+                    problems.append(f"{tag} {e}")
+            if r.transition_duration is not None and r.transition_duration < 0:
+                problems.append(f"{tag} transition_duration cannot be negative")
 
         total = self.total_duration
         if total > target.max_duration_s:

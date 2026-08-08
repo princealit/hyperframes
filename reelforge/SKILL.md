@@ -1,6 +1,6 @@
 ---
 name: reelforge
-description: Edit footage into Instagram Reels, TikToks and Shorts by conversation. Transcribe, choose takes, cut, reframe landscape footage to vertical with subject tracking, caption, overlay motion graphics, and render posting-ready. Use when the user has video files and wants them cut for a vertical feed, or asks to make a Reel, Short or TikTok from existing footage.
+description: Make vertical video — Instagram Reels, TikToks, Shorts — by conversation. Transcribe, choose takes, cut, join clips with transitions, reframe landscape footage to vertical with subject tracking, caption, overlay motion graphics, generate footage/narration/music when there is none, and render posting-ready. Use when the user has video files to cut for a vertical feed, or asks to make a Reel, Short or TikTok, with or without source footage.
 ---
 
 # reelforge
@@ -69,8 +69,30 @@ sentence, not a strategy document.
 structure needs rearranging, or when captions are wanted. This is the rest of
 this document.
 
+**Generated route — no footage.** When the user has nothing to cut, generate it:
+`reelforge generate` for stills, video, narration and music, then `reelforge
+clip` to turn a still into a shot. Check `--list-providers` first and say which
+one will run — with no API key the offline providers produce placeholders and
+robotic speech, which are right for building and timing a cut and wrong for
+anything anyone will watch. Never present placeholder output as finished.
+
 Reach for the fast route when it genuinely fits. Transcribing a single clean
 take to remove three pauses is ceremony.
+
+## Looking at the footage
+
+`reelforge view <source> <start> <end>` renders a filmstrip over the waveform.
+Over MCP it comes back as an image you can actually see.
+
+Use it at decision points the transcript cannot settle — did the subject stay in
+frame, does this cut flash, which take is framed better. Do not scan a whole
+timeline with it; it is slow and mostly shows nothing.
+
+Before showing any render to the user, run `review_cuts` on it. One filmstrip
+per seam, and you look for: a flash or jump at the boundary, the subject leaving
+frame, captions hidden behind an overlay, an overlay showing the wrong frames.
+Fix and re-render, up to three passes, then tell the user what you could not
+resolve rather than looping.
 
 ## The loop
 
@@ -177,7 +199,30 @@ screen recording wants `track` then `blur_pad`.
 `saliency` for footage with no faces, `face` when you know there is one and want
 it prioritised.
 
-## Step 6 — captions
+## Step 6 — joining clips
+
+Cuts are the default and are usually right. Soften a seam only when it earns it:
+
+| transition                 | when                                                        |
+| -------------------------- | ----------------------------------------------------------- |
+| `crossfade`                | two angles of one moment, or a gentle time passage          |
+| `dip_black`                | a hard break between sections — the strongest punctuation   |
+| `dip_white`                | brighter, more energetic; product and reveals               |
+| `whip_left` / `whip_right` | fast location or subject change; alternate direction        |
+| `blur`                     | shots that share no visual anchor                           |
+| `slide_up`                 | forward motion through a sequence; native to vertical feeds |
+| `zoom`                     | a reveal or a sharp escalation in energy                    |
+
+```json
+{ "source": "B", "start": 3.0, "end": 7.5, "transition": "crossfade" }
+```
+
+The seam belongs to the incoming clip. Two things to hold on to: a transition
+**consumes timeline time**, so the render is shorter than the sum of the ranges;
+and dissolving every cut is the single fastest way to make a Reel look like a
+2009 holiday slideshow. Most seams should stay cuts.
+
+## Step 7 — captions
 
 `punch` is the default and is right most of the time. `karaoke` and `pop`
 highlight word by word and suit fast, energetic delivery. `clean` and `boxed`
@@ -186,7 +231,7 @@ suit explainers and anything an audience will read rather than feel.
 Placement is computed from the platform's safe area. Do not hand-position
 captions; change `platform` and they move correctly on their own.
 
-## Step 7 — motion graphics (optional)
+## Step 8 — motion graphics (optional)
 
 Overlay slots are HyperFrames compositions rendered to alpha WebM.
 
@@ -213,7 +258,7 @@ Timing rule that matters: if the overlay lands on a spoken payoff word, start it
 `reveal_duration` seconds _earlier_ so the landing frame coincides with the word.
 Without that it reads as disconnected.
 
-## Step 8 — lint, render, verify
+## Step 9 — lint, render, verify
 
 `reelforge lint edl.json` before rendering. Fix what it finds or decide not to
 and say so.
@@ -227,7 +272,7 @@ read that report.
 If something is wrong: fix, re-render, re-check. Cap at three passes, then tell
 the user what you could not resolve rather than looping.
 
-## Step 9 — persist
+## Step 10 — persist
 
 Append to `.reelforge/project.md`:
 
@@ -253,3 +298,7 @@ Append to `.reelforge/project.md`:
 - Assuming the video is chronological. The best line usually belongs at the top.
 - Captions at the very bottom of frame. The platform UI covers them; the safe
   area exists to stop this and only works if you let it.
+- A transition on every seam. Cuts are the default for a reason.
+- Presenting placeholder or `espeak` output as finished work. Say which
+  provider ran.
+- Showing a render you have not run `review_cuts` on.

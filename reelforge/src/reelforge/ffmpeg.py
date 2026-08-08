@@ -196,6 +196,28 @@ def probe(path: str | Path) -> MediaInfo:
     )
 
 
+def media_duration(path: str | Path) -> float:
+    """Duration of any media, including audio-only files.
+
+    `probe` deliberately requires a video stream, since everything it returns is
+    about picture geometry. Generated speech and music are audio-only, and their
+    duration is load-bearing — narration length determines how long the picture
+    under it has to run — so those need a path that does not go through `probe`.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"media not found: {p}")
+    raw = run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(p),
+    ])
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return 0.0
+
+
 # --- Shared filter fragments ------------------------------------------------
 
 #: Tone-map HDR (PQ/HLG) into clean Rec.709 SDR.

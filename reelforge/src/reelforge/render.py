@@ -187,6 +187,48 @@ def concat(segments: list[Path], out_path: Path, work_dir: Path) -> None:
     listing.unlink(missing_ok=True)
 
 
+def join_with_transitions(
+    segments: list[Path],
+    edl: EDL,
+    out_path: Path,
+    quality: Quality,
+    fps: int,
+    has_audio: bool,
+) -> None:
+    """Join segments through `xfade`/`acrossfade` seams.
+
+    Only used when at least one seam is not a cut. A transition overlaps its
+    neighbours, so the segments cannot be stream-copied end to end — this path
+    necessarily re-encodes, which is the cost of the effect and the reason cuts
+    keep the faster route.
+    """
+    from .transitions import build_graph
+
+    graph, v_label, a_label = build_graph(
+        edl.segment_durations,
+        edl.transition_names(),
+        edl.transition_durations(),
+        has_audio=has_audio,
+    )
+
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    for seg in segments:
+        cmd += ["-i", str(seg)]
+    cmd += [
+        "-filter_complex", graph,
+        "-map", f"[{v_label}]" if not v_label[0].isdigit() else v_label,
+    ]
+    if has_audio:
+        cmd += ["-map", f"[{a_label}]" if not a_label[0].isdigit() else a_label]
+    cmd += [
+        "-c:v", "libx264", "-preset", quality.preset, "-crf", str(quality.crf),
+        "-pix_fmt", "yuv420p", "-r", str(fps),
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart", str(out_path),
+    ]
+    run(cmd)
+
+
 # --- Step 3+4: overlays and captions ----------------------------------------
 
 
@@ -464,10 +506,24 @@ def render(
         )
         segments.append(seg_path)
 
-    # 2. concat
+    # 2. join — stream-copy concat when every seam is a cut, filtergraph when not
     base_video = work / f"base_{quality}.mp4"
-    concat(segments, base_video, work)
-    _log(result, f"concat   {len(segments)} segment(s) -> {base_video.name}", verbose)
+    if edl.has_transitions:
+        join_with_transitions(segments, edl, base_video, q, fps, any_audio)
+        seams = [
+            f"{n}@{d:.2f}s"
+            for n, d in zip(edl.transition_names()[1:], edl.transition_durations()[1:])
+            if d > 0
+        ]
+        _log(
+            result,
+            f"join     {len(segments)} segment(s) with {len(seams)} transition(s): "
+            f"{', '.join(seams)}",
+            verbose,
+        )
+    else:
+        concat(segments, base_video, work)
+        _log(result, f"concat   {len(segments)} segment(s) -> {base_video.name}", verbose)
 
     # 3/4. captions then composite
     ass_path: Path | None = None

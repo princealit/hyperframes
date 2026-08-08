@@ -17,7 +17,9 @@ import subprocess
 import numpy as np
 import pytest
 
-from reelforge.edl import EDL, CaptionSpec, Range
+from pathlib import Path
+
+from reelforge.edl import EDL, CaptionSpec, Overlay, Range
 from reelforge.ffmpeg import probe
 from reelforge.reframe import plan_reframe
 from reelforge.render import render
@@ -333,3 +335,153 @@ def test_autocut_refuses_a_silent_source(tmp_path):
     ], check=True, capture_output=True)
     with pytest.raises(ValueError, match="no audio track"):
         autocut(path)
+
+
+# --- multi-source assembly and overlay compositing --------------------------
+
+
+@pytest.fixture(scope="module")
+def two_sources(tmp_path_factory):
+    """Two clips that differ in resolution, frame rate and colour.
+
+    Different geometry per source is the point: each must be reframed on its own
+    terms and still concatenate cleanly. The distinct base colours make it
+    possible to prove from the pixels which source a given output frame came
+    from, rather than trusting the segment list.
+    """
+    d = tmp_path_factory.mktemp("multi")
+    specs = [
+        ("A.mp4", "#1B3A6B", "1920x1080", 30, 200),
+        ("B.mp4", "#6B1B2E", "1280x720", 25, 330),
+    ]
+    for name, colour, size, fps, freq in specs:
+        subprocess.run([
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", f"color=c={colour}:s={size}:d=5:r={fps}",
+            "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=5",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(d / name),
+        ], check=True, capture_output=True)
+    return d
+
+
+@pytest.fixture(scope="module")
+def alpha_overlay(tmp_path_factory):
+    """A ProRes 4444 badge with genuine transparency.
+
+    Built with alphamerge rather than a transparent `color` source: lavfi's
+    `color` negotiates to a format without an alpha plane, so `black@0.0`
+    silently produces an opaque frame and the overlay would composite as a box.
+    """
+    path = tmp_path_factory.mktemp("overlay") / "badge.mov"
+    font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    if not Path(font).exists():
+        pytest.skip("DejaVu font not available")
+    draw = "text='BADGE':fontsize=110:x=(w-text_w)/2:y=(h-text_h)/2"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=black:s=700x220:d=3:r=30",
+        "-filter_complex",
+        f"[0:v]drawtext=fontfile={font}:{draw}:fontcolor=#FFD400[fg];"
+        f"[0:v]drawtext=fontfile={font}:{draw}:fontcolor=white,format=gray[mk];"
+        f"[fg][mk]alphamerge,format=yuva444p10le[o]",
+        "-map", "[o]", "-c:v", "prores_ks", "-profile:v", "4444",
+        "-pix_fmt", "yuva444p10le", str(path),
+    ], check=True, capture_output=True)
+    return path
+
+
+def _mean_rgb(path, t):
+    raw = subprocess.run([
+        "ffmpeg", "-v", "error", "-ss", str(t), "-i", str(path),
+        "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+    ], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(int).mean(0)
+
+
+def _badge_span(path, t, height=1920, width=1080):
+    """Vertical extent and pixel count of the #FFD400 badge in one frame."""
+    raw = subprocess.run([
+        "ffmpeg", "-v", "error", "-ss", str(t), "-i", str(path),
+        "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+    ], capture_output=True, check=True).stdout
+    f = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).astype(int)
+    m = (f[:, :, 0] > 200) & (f[:, :, 1] > 150) & (f[:, :, 2] < 90)
+    if m.sum() < 50:
+        return None, 0
+    ys = np.argwhere(m)[:, 0]
+    return (int(ys.min()), int(ys.max())), int(m.sum())
+
+
+def test_sources_of_different_size_and_fps_assemble(two_sources, tmp_path):
+    edl = EDL(
+        sources={"A": "A.mp4", "B": "B.mp4"},
+        ranges=[
+            Range(source="A", start=0.2, end=2.2, beat="HOOK"),
+            Range(source="B", start=1.0, end=3.0, beat="TURN"),
+            Range(source="A", start=3.0, end=4.8, beat="PAYOFF"),
+        ],
+        platform="reels", detector="saliency",
+        captions=CaptionSpec(enabled=False),
+    )
+    out = tmp_path / "multi.mp4"
+    result = render(edl, out, quality="draft", base_dir=two_sources, verbose=False)
+
+    # Each source is cropped on its own geometry.
+    assert result.reframe_plans[0].geometry.crop_h == 1080
+    assert result.reframe_plans[1].geometry.crop_h == 720
+    info = probe(out)
+    assert info.duration == pytest.approx(5.8, abs=0.4)
+
+    # Prove the cut from the pixels: the middle segment is the other source.
+    assert _mean_rgb(out, 1.0)[2] > _mean_rgb(out, 1.0)[0]   # A reads blue
+    assert _mean_rgb(out, 2.6)[0] > _mean_rgb(out, 2.6)[2]   # B reads red
+    assert _mean_rgb(out, 4.6)[2] > _mean_rgb(out, 4.6)[0]   # back to A
+
+
+def test_overlays_composite_with_alpha_at_the_anchors_given(
+    two_sources, alpha_overlay, tmp_path
+):
+    shutil.copy2(alpha_overlay, two_sources / "badge.mov")
+    edl = EDL(
+        sources={"A": "A.mp4"},
+        ranges=[Range(source="A", start=0.0, end=5.0, beat="HOOK")],
+        platform="reels", detector="saliency",
+        captions=CaptionSpec(enabled=False),
+        overlays=[
+            Overlay(file="badge.mov", start_in_output=0.4, duration=2.0,
+                    anchor="top-center", scale=0.9, fade_in=0.2),
+            Overlay(file="badge.mov", start_in_output=3.4, duration=1.4,
+                    anchor="bottom-center", scale=0.6, dy=-120, opacity=0.85),
+        ],
+    )
+    out = tmp_path / "over.mp4"
+    render(edl, out, quality="final", base_dir=two_sources, verbose=False)
+
+    top_span, top_px = _badge_span(out, 1.4)
+    gap_span, gap_px = _badge_span(out, 3.0)
+    low_span, low_px = _badge_span(out, 4.0)
+
+    assert top_px > 1000, "top overlay did not composite"
+    assert gap_px == 0, "overlay visible outside its window"
+    assert low_px > 500, "bottom overlay did not composite"
+
+    # Anchoring: the first sits high, the second low, both inside the safe area.
+    platform = edl.target
+    safe = platform.safe_at(1080, 1920)
+    assert top_span[0] >= safe.top - 2
+    assert low_span[1] <= 1920 - safe.bottom
+    assert top_span[1] < low_span[0], "anchors did not separate the overlays"
+
+    # Alpha held: a smaller, more transparent overlay covers fewer pixels.
+    assert low_px < top_px
+
+
+def test_overlay_outside_the_timeline_is_rejected(two_sources):
+    edl = EDL(
+        sources={"A": "A.mp4"},
+        ranges=[Range(source="A", start=0.0, end=4.0)],
+        overlays=[Overlay(file="A.mp4", start_in_output=99.0, duration=1.0)],
+    )
+    with pytest.raises(Exception):
+        edl.validate(base_dir=two_sources)

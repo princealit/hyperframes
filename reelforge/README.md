@@ -38,6 +38,21 @@ margin that happens to work on one device. Change `platform` and everything move
 hook strength, pace, dead air, shot-length monotony, caption legibility, safe-zone
 violations. It reports what to fix while fixing is still cheap.
 
+## Scope — what is and isn't here
+
+reelforge is a complete **editor**. It is not a merge of all three projects, and
+the gap is worth stating plainly rather than discovering later.
+
+|                                       | status                                                                                                                                                                          |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **video-use** — the editing half      | Ported and extended. Missing its `timeline_view` filmstrip drill-down and its automated self-eval loop.                                                                         |
+| **OpenMontage** — the generation half | **Not ported.** No AI video/image generation, no TTS, no music generation, no provider registry, no avatar/lipsync, no 12-pipeline system, no Backlot UI, no Remotion composer. |
+| **HyperFrames**                       | Integrated as a bridge — scaffold, lint and render overlay slots. The 50+ registry blocks and motion-doctrine skills are not wrapped.                                           |
+
+So: footage in, edited vertical video out — that path is complete and tested.
+Text or a brief in, generated video out — that is OpenMontage's territory and is
+not built here. Most of OpenMontage is that second path.
+
 ## Install
 
 ```bash
@@ -91,8 +106,42 @@ Neither is required to edit. `autocut` works from the waveform, and captions
 only need a transcript file — drop one at `.reelforge/transcripts/<source>.json`
 from any source and everything else works.
 
-Or let the agent drive the whole thing — see [`SKILL.md`](SKILL.md), which
-installs as a Claude Code skill.
+## MCP
+
+The pipeline is also an MCP server, so Claude can call it directly instead of
+shelling out.
+
+```bash
+pip install -e ".[mcp]"
+claude mcp add reelforge -- reelforge-mcp
+```
+
+Or in `claude_desktop_config.json` / `.mcp.json`:
+
+```json
+{ "mcpServers": { "reelforge": { "command": "reelforge-mcp" } } }
+```
+
+Then just talk to it: _"make this landscape clip into a Reel."_
+
+| tool                                          | does                                                    |
+| --------------------------------------------- | ------------------------------------------------------- |
+| `check_environment`                           | what this machine can actually do                       |
+| `probe_media`                                 | geometry, duration, whether it needs reframing          |
+| `list_capabilities`                           | platforms, safe zones, styles, grades                   |
+| `autocut`                                     | dead-air trim → EDL, no transcript needed               |
+| `transcribe`                                  | word-level ASR, cached                                  |
+| `pack_takes`                                  | **returns the transcript view inline** for cut planning |
+| `write_edl`                                   | validate and save an edit                               |
+| `lint_edl`                                    | **returns the retention report inline**                 |
+| `render`                                      | the full render pipeline                                |
+| `create_overlay_slot` / `render_overlay_slot` | HyperFrames motion graphics                             |
+
+The two reading tools return their content inline rather than writing a file —
+that is the point of the MCP surface, and the difference between an agent that
+can reason about a cut and one parsing stdout.
+
+Or drive it as a plain skill instead — see [`SKILL.md`](SKILL.md).
 
 ## The EDL
 

@@ -17,15 +17,20 @@ vision = ["opencv-python-headless>=4.8,<5"]
 transcribe = ["requests>=2.31"]
 # Local word-level ASR. No API key, nothing leaves the machine.
 local = ["faster-whisper>=1.0"]
-dev = ["pytest>=8.0"]
+# Expose the pipeline as MCP tools for Claude Code / Claude Desktop.
+mcp = ["mcp>=2.0", "anyio>=4.0"]
+dev = ["pytest>=8.0", "anyio>=4.0", "mcp>=2.0"]
 all = [
     "opencv-python-headless>=4.8,<5",
     "requests>=2.31",
     "faster-whisper>=1.0",
+    "mcp>=2.0",
+    "anyio>=4.0",
 ]
 
 [project.scripts]
 reelforge = "reelforge.cli:main"
+reelforge-mcp = "reelforge.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]

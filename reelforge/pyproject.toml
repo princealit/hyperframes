@@ -13,12 +13,15 @@ dependencies = [
 # Face-aware reframing. Without it the tracker falls back to saliency, which
 # needs nothing beyond numpy.
 vision = ["opencv-python-headless>=4.8,<5"]
-# Hosted word-level ASR.
+# Hosted word-level ASR (ElevenLabs Scribe).
 transcribe = ["requests>=2.31"]
+# Local word-level ASR. No API key, nothing leaves the machine.
+local = ["faster-whisper>=1.0"]
 dev = ["pytest>=8.0"]
 all = [
     "opencv-python-headless>=4.8,<5",
     "requests>=2.31",
+    "faster-whisper>=1.0",
 ]
 
 [project.scripts]

@@ -51,6 +51,27 @@ Breaking these produces silent, shipped defects.
 8. **Report what the linter says.** If you ship with warnings outstanding, say
    which and why.
 
+## Two routes
+
+**Fast route — no transcript.** When the ask is "tighten this up" or "make this
+vertical", and there is one take rather than several to choose between:
+
+```bash
+reelforge autocut clip.mp4 --grade punch
+reelforge render edl.json -q preview -o preview.mp4
+```
+
+`autocut` finds dead air in the waveform and writes an EDL. No ASR, no network,
+no key. Still confirm the plan with the user first — but the plan is one
+sentence, not a strategy document.
+
+**Full route — transcript-driven.** When there are multiple takes, when the
+structure needs rearranging, or when captions are wanted. This is the rest of
+this document.
+
+Reach for the fast route when it genuinely fits. Transcribing a single clean
+take to remove three pauses is ceremony.
+
 ## The loop
 
 ```bash

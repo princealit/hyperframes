@@ -5,12 +5,22 @@ Whisper's default segments) throws away the sub-second gap data that cut
 selection depends on — you cannot snap a cut to a word boundary you were never
 given, and you cannot find the 400ms silence that makes the cleanest edit point.
 
-Verbatim matters too. A transcriber that helpfully removes "um" also removes the
-signal that a take had a stumble, which is exactly what take selection needs.
+Two backends, same output shape:
 
-Caching is keyed on a hash of the audio content, not the filename or mtime, so
-re-transcription happens when the footage genuinely changes and never because a
-file was copied or touched.
+**scribe** — hosted ElevenLabs Scribe. Verbatim, so stumbles and fillers survive
+as the editorial signal they are, with speaker diarization. Needs a key, and the
+audio leaves the machine.
+
+**whisper** — local faster-whisper. No key, nothing uploaded, slower on CPU. It
+also normalises: "um", "uh" and false starts are largely scrubbed. That is fine
+for a single clean take and a real loss for choosing between takes, because the
+thing you were selecting *on* is the thing it removed.
+
+`auto` prefers Scribe when a key is present and falls back to local.
+
+Caching is keyed on a hash of the audio content *and* the backend that produced
+it, so re-transcription happens when the footage genuinely changes or the
+backend does — never because a file was copied or touched.
 """
 
 from __future__ import annotations
@@ -21,11 +31,19 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Literal
 
 from .ffmpeg import run
 
+Backend = Literal["auto", "scribe", "whisper"]
+
 SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text"
-DEFAULT_MODEL = "scribe_v1"
+SCRIBE_MODEL = "scribe_v1"
+
+#: Default local model. `base` transcribes roughly 6-10x faster than real time
+#: on a modern CPU and its word timings are accurate enough to cut on. Step up
+#: to `small` when the audio is noisy or accented; `tiny` is rarely worth it.
+WHISPER_MODEL = "base"
 
 #: Extensions treated as transcribable media when scanning a directory.
 MEDIA_SUFFIXES = frozenset({
@@ -44,6 +62,7 @@ class TranscribeResult:
     output: Path
     words: int
     cached: bool
+    backend: str = ""
 
 
 def content_key(path: Path) -> str:
@@ -65,65 +84,79 @@ def content_key(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
-def extract_audio(source: Path, out_path: Path) -> Path:
-    """Downmix to 16kHz mono Opus before upload.
+def extract_audio(source: Path, out_path: Path, *, wav: bool = False) -> Path:
+    """Downmix to 16kHz mono before transcription.
 
-    ASR models work from a mono 16kHz signal regardless of what is uploaded, so
-    sending a 4K video's original audio wastes upload time proportional to the
-    file size for no accuracy gain. This routinely turns a 2GB upload into
-    a few megabytes.
+    Every ASR model resamples to mono 16kHz internally, so uploading a 4K take's
+    original audio costs upload time proportional to file size for no accuracy
+    gain. Opus for the hosted path (a 2GB source becomes a few megabytes); WAV
+    for the local path, where there is no upload and decoding is the only cost.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    codec = ["-c:a", "pcm_s16le"] if wav else ["-c:a", "libopus", "-b:a", "32k"]
     run([
         "ffmpeg", "-y", "-v", "error", "-i", str(source),
-        "-vn", "-ac", "1", "-ar", "16000",
-        "-c:a", "libopus", "-b:a", "32k",
-        str(out_path),
+        "-vn", "-ac", "1", "-ar", "16000", *codec, str(out_path),
     ])
     return out_path
 
 
-def transcribe_file(
-    source: Path,
-    out_dir: Path,
+# --- Backends ---------------------------------------------------------------
+
+
+def whisper_available() -> bool:
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def resolve_backend(backend: Backend, api_key: str | None = None) -> str:
+    """Decide which backend will actually run, and say why it cannot."""
+    key = api_key or os.environ.get("ELEVENLABS_API_KEY")
+    if backend == "scribe":
+        if not key:
+            raise TranscriptionError(
+                "backend 'scribe' needs ELEVENLABS_API_KEY. Set it in the environment "
+                "or a .env file at the project root, or use --backend whisper to run "
+                "locally with no key."
+            )
+        return "scribe"
+    if backend == "whisper":
+        if not whisper_available():
+            raise TranscriptionError(
+                "backend 'whisper' needs faster-whisper — install with: "
+                "pip install 'reelforge[local]'"
+            )
+        return "whisper"
+    if key:
+        return "scribe"
+    if whisper_available():
+        return "whisper"
+    raise TranscriptionError(
+        "no transcription backend available. Either set ELEVENLABS_API_KEY, or "
+        "install the local backend with: pip install 'reelforge[local]'"
+    )
+
+
+def _scribe(
+    audio: Path,
     *,
-    api_key: str | None = None,
-    name: str | None = None,
+    api_key: str,
     num_speakers: int | None = None,
     language: str | None = None,
-    force: bool = False,
-) -> TranscribeResult:
-    """Transcribe one file, reusing a cached transcript when the content matches."""
+) -> dict[str, Any]:
     try:
         import requests
     except ImportError:
         raise TranscriptionError(
-            "the `requests` package is required — install with: pip install 'reelforge[transcribe]'"
+            "the `requests` package is required for the hosted backend — "
+            "install with: pip install 'reelforge[transcribe]'"
         ) from None
 
-    name = name or source.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{name}.json"
-    key = content_key(source)
-
-    if out_path.exists() and not force:
-        try:
-            existing = json.loads(out_path.read_text())
-            if existing.get("_reelforge", {}).get("content_key") == key:
-                return TranscribeResult(source, out_path, len(existing.get("words", [])), True)
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    api_key = api_key or os.environ.get("ELEVENLABS_API_KEY")
-    if not api_key:
-        raise TranscriptionError(
-            "ELEVENLABS_API_KEY is not set. Put it in the environment or in a .env "
-            "file at the project root. Get one at elevenlabs.io/app/settings/api-keys"
-        )
-
-    audio = extract_audio(source, out_dir / "_audio" / f"{name}.opus")
     data = {
-        "model_id": DEFAULT_MODEL,
+        "model_id": SCRIBE_MODEL,
         # Word granularity is the point of this module; anything coarser
         # discards the boundaries cut selection relies on.
         "timestamps_granularity": "word",
@@ -145,39 +178,150 @@ def transcribe_file(
                 timeout=900,
             )
     except requests.RequestException as e:
-        raise TranscriptionError(f"transcription request failed for {source.name}: {e}") from None
+        raise TranscriptionError(f"transcription request failed: {e}") from None
 
     if resp.status_code != 200:
-        detail = resp.text[:400]
         raise TranscriptionError(
-            f"transcription failed for {source.name} (HTTP {resp.status_code}): {detail}"
+            f"transcription failed (HTTP {resp.status_code}): {resp.text[:400]}"
         )
+    return resp.json()
 
-    payload = resp.json()
+
+def _whisper(
+    audio: Path,
+    *,
+    model_size: str = WHISPER_MODEL,
+    language: str | None = None,
+) -> dict[str, Any]:
+    """Local transcription, emitted in the Scribe payload shape.
+
+    Deliberately runs without VAD filtering. VAD would drop silent spans, and
+    silence is not noise here — the gaps between phrases are precisely the cut
+    candidates the rest of the pipeline reads. Filtering them out would make the
+    transcript smaller and the edit worse.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        raise TranscriptionError(
+            "faster-whisper is not installed — pip install 'reelforge[local]'"
+        ) from None
+
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    segments, info = model.transcribe(
+        str(audio),
+        word_timestamps=True,
+        vad_filter=False,
+        language=language,
+        # Whisper can loop on repeated phrasing when it conditions on its own
+        # prior output; disabling it trades a little fluency for reliability.
+        condition_on_previous_text=False,
+    )
+
+    words: list[dict[str, Any]] = []
+    for segment in segments:
+        for w in segment.words or []:
+            text = (w.word or "").strip()
+            if not text or w.start is None or w.end is None:
+                continue
+            words.append({
+                "text": text,
+                "start": round(float(w.start), 3),
+                "end": round(float(w.end), 3),
+                "type": "word",
+                # Whisper does not diarize; a single label keeps the shape
+                # consistent for `pack`, which groups on speaker change.
+                "speaker_id": "S0",
+            })
+
+    return {
+        "language_code": getattr(info, "language", language or "") or "",
+        "language_probability": getattr(info, "language_probability", None),
+        "text": " ".join(w["text"] for w in words),
+        "words": words,
+    }
+
+
+# --- Orchestration ----------------------------------------------------------
+
+
+def transcribe_file(
+    source: Path,
+    out_dir: Path,
+    *,
+    backend: Backend = "auto",
+    api_key: str | None = None,
+    name: str | None = None,
+    num_speakers: int | None = None,
+    language: str | None = None,
+    model_size: str = WHISPER_MODEL,
+    force: bool = False,
+) -> TranscribeResult:
+    """Transcribe one file, reusing a cached transcript when nothing changed."""
+    name = name or source.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{name}.json"
+
+    chosen = resolve_backend(backend, api_key)
+    stamp = f"{chosen}:{model_size}" if chosen == "whisper" else chosen
+    key = content_key(source)
+
+    if out_path.exists() and not force:
+        try:
+            existing = json.loads(out_path.read_text())
+            meta = existing.get("_reelforge", {})
+            if meta.get("content_key") == key and meta.get("backend") == stamp:
+                return TranscribeResult(
+                    source, out_path, len(existing.get("words", [])), True, chosen
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    audio_dir = out_dir / "_audio"
+    if chosen == "scribe":
+        audio = extract_audio(source, audio_dir / f"{name}.opus")
+        payload = _scribe(
+            audio,
+            api_key=api_key or os.environ["ELEVENLABS_API_KEY"],
+            num_speakers=num_speakers,
+            language=language,
+        )
+    else:
+        audio = extract_audio(source, audio_dir / f"{name}.wav", wav=True)
+        payload = _whisper(audio, model_size=model_size, language=language)
+
     payload["_reelforge"] = {
         "content_key": key,
         "source": str(source),
-        "model": DEFAULT_MODEL,
+        "backend": stamp,
     }
     out_path.write_text(json.dumps(payload, indent=1))
     audio.unlink(missing_ok=True)
-    return TranscribeResult(source, out_path, len(payload.get("words", [])), False)
+    return TranscribeResult(source, out_path, len(payload.get("words", [])), False, chosen)
 
 
 def transcribe_dir(
     sources: list[Path],
     out_dir: Path,
     *,
+    backend: Backend = "auto",
     api_key: str | None = None,
     workers: int = 4,
     force: bool = False,
     num_speakers: int | None = None,
+    model_size: str = WHISPER_MODEL,
 ) -> list[TranscribeResult]:
-    """Transcribe several sources concurrently.
+    """Transcribe several sources, in parallel where that helps.
 
-    The work is network-bound, so threads are the right tool and four is enough
-    to saturate a typical uplink without tripping rate limits.
+    The hosted backend is network-bound, so threads overlap usefully. The local
+    backend is CPU-bound and already threads internally, so running several
+    models at once mostly contends for the same cores and inflates peak memory —
+    it is deliberately serialised.
     """
+    chosen = resolve_backend(backend, api_key)
+    if chosen == "whisper":
+        workers = 1
+
     results: list[TranscribeResult] = []
     errors: list[str] = []
 
@@ -185,14 +329,19 @@ def transcribe_dir(
         try:
             results.append(
                 transcribe_file(
-                    path, out_dir, api_key=api_key, force=force, num_speakers=num_speakers
+                    path, out_dir, backend=backend, api_key=api_key, force=force,
+                    num_speakers=num_speakers, model_size=model_size,
                 )
             )
         except Exception as e:  # noqa: BLE001 — collected and reported together
             errors.append(f"{path.name}: {e}")
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        list(pool.map(one, sources))
+    if workers <= 1:
+        for path in sources:
+            one(path)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(one, sources))
 
     if errors and not results:
         raise TranscriptionError("all transcriptions failed:\n  " + "\n  ".join(errors))

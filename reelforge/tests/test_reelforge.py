@@ -666,3 +666,59 @@ def test_report_score_decreases_with_severity():
     assert clean.score == 100
     assert noisy.score < clean.score
     assert not noisy.ok
+
+
+# --- autocut ----------------------------------------------------------------
+
+
+def test_keep_spans_inverts_silence():
+    from reelforge.autocut import Span, keep_spans
+
+    spans = keep_spans(10.0, [Span(2.0, 4.0)], pad=0.0, min_keep=0.1)
+    assert [(s.start, s.end) for s in spans] == [(0.0, 2.0), (4.0, 10.0)]
+
+
+def test_no_silence_keeps_everything():
+    from reelforge.autocut import keep_spans
+
+    spans = keep_spans(10.0, [], pad=0.0)
+    assert len(spans) == 1 and spans[0].duration == 10.0
+
+
+def test_padding_extends_into_the_silence():
+    # Cutting exactly on the boundary clips consonant attack and decay.
+    from reelforge.autocut import Span, keep_spans
+
+    spans = keep_spans(10.0, [Span(3.0, 6.0)], pad=0.25, min_keep=0.1)
+    assert spans[0].end == pytest.approx(3.25)
+    assert spans[1].start == pytest.approx(5.75)
+
+
+def test_padding_never_runs_past_the_clip():
+    from reelforge.autocut import Span, keep_spans
+
+    spans = keep_spans(10.0, [Span(0.0, 1.0), Span(9.0, 10.0)], pad=0.5, min_keep=0.1)
+    assert spans[0].start >= 0.0
+    assert spans[-1].end <= 10.0
+
+
+def test_padding_merges_spans_it_closes():
+    # Two keeps separated by a gap narrower than twice the pad become one.
+    from reelforge.autocut import Span, keep_spans
+
+    spans = keep_spans(10.0, [Span(4.0, 4.4)], pad=0.5, min_keep=0.1)
+    assert len(spans) == 1
+
+
+def test_fragments_are_discarded():
+    # A 100ms island between two silences is a breath, not speech.
+    from reelforge.autocut import Span, keep_spans
+
+    spans = keep_spans(10.0, [Span(0.0, 5.0), Span(5.1, 10.0)], pad=0.0, min_keep=0.3)
+    assert spans == []
+
+
+def test_keep_spans_handles_a_zero_length_clip():
+    from reelforge.autocut import keep_spans
+
+    assert keep_spans(0.0, []) == []

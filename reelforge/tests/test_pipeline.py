@@ -265,3 +265,71 @@ def test_the_linter_accepts_a_real_render(project):
                   rendered=result.output)
     assert report.ok, report.format()
     assert "render.drift" not in {f.code for f in report.findings}
+
+
+# --- autocut (real silencedetect) -------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def gapped_audio(tmp_path_factory):
+    """Tone, silence, tone, silence, tone — known boundaries by construction."""
+    path = tmp_path_factory.mktemp("media") / "gapped.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=#202030:s=1280x720:d=9:r=30",
+        "-f", "lavfi", "-i",
+        "sine=frequency=300:duration=9:sample_rate=48000",
+        "-filter_complex",
+        # Audible on 0-2, 4-6 and 7.5-9; silent elsewhere.
+        "[1:a]volume='if(between(t,0,2)+between(t,4,6)+between(t,7.5,9),1,0)':eval=frame[a]",
+        "-map", "0:v", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest", str(path),
+    ], check=True, capture_output=True)
+    return path
+
+
+def test_silences_are_detected_where_they_were_placed(gapped_audio):
+    from reelforge.autocut import detect_silences
+
+    silences = detect_silences(gapped_audio, min_silence=0.3)
+    assert len(silences) >= 2
+    # A silence should cover the 2-4s window that was muted.
+    assert any(s.start < 2.4 and s.end > 3.6 for s in silences)
+
+
+def test_autocut_removes_dead_air_and_keeps_the_audible_spans(gapped_audio):
+    from reelforge.autocut import autocut
+
+    edl, stats = autocut(gapped_audio, platform="reels")
+    assert stats["removed_s"] > 2.0
+    assert stats["cuts"] >= 2
+    assert edl.total_duration < stats["source_duration"]
+    assert edl.ranges[0].beat == "HOOK"
+
+
+def test_autocut_output_renders(gapped_audio, tmp_path):
+    from reelforge.autocut import autocut
+
+    shutil.copy2(gapped_audio, tmp_path / gapped_audio.name)
+    edl, _ = autocut(tmp_path / gapped_audio.name, platform="reels")
+    edl.validate(base_dir=tmp_path)
+    result = render(edl, tmp_path / "cut.mp4", quality="draft",
+                    base_dir=tmp_path, verbose=False)
+    info = probe(result.output)
+    assert info.height > info.width
+    assert info.duration == pytest.approx(edl.total_duration, abs=0.4)
+
+
+def test_autocut_refuses_a_silent_source(tmp_path):
+    from reelforge.autocut import autocut
+
+    path = tmp_path / "silent.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=black:s=640x360:d=3:r=30",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-an", str(path),
+    ], check=True, capture_output=True)
+    with pytest.raises(ValueError, match="no audio track"):
+        autocut(path)

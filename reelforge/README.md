@@ -53,9 +53,18 @@ on b-roll and screencasts, weaker on faces.
 
 ## Use
 
+The fast path — trim dead air and go vertical, no transcript required:
+
 ```bash
 cd ~/footage/my-reel
 
+reelforge autocut take-01.mp4 --grade punch   # → edl.json
+reelforge render edl.json -o final.mp4
+```
+
+The full path, when you want the cut chosen on what was actually said:
+
+```bash
 reelforge init                          # scan sources, scaffold the project
 reelforge transcribe                    # word-level ASR, cached per source
 reelforge pack                          # → takes.md, the agent's reading view
@@ -64,6 +73,23 @@ reelforge lint edl.json                 # retention + correctness report
 reelforge render edl.json -q preview    # look at it
 reelforge render edl.json -o final.mp4  # post it
 ```
+
+## Transcription
+
+Two backends, same output shape. `auto` picks hosted when a key is present.
+
+| backend   | needs                    | trade-off                                                                                                        |
+| --------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `scribe`  | `ELEVENLABS_API_KEY`     | Verbatim — fillers and stumbles survive as the signal for choosing between takes. Audio is uploaded.             |
+| `whisper` | `pip install '.[local]'` | No key, nothing leaves the machine. Slower on CPU, and it normalises fillers away, which weakens take selection. |
+
+```bash
+reelforge transcribe --backend whisper --model base
+```
+
+Neither is required to edit. `autocut` works from the waveform, and captions
+only need a transcript file — drop one at `.reelforge/transcripts/<source>.json`
+from any source and everything else works.
 
 Or let the agent drive the whole thing — see [`SKILL.md`](SKILL.md), which
 installs as a Claude Code skill.

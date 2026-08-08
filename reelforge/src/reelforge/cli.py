@@ -24,10 +24,13 @@ from .pack import pack_project
 from .reframe import vision_available
 from .retention import lint as lint_edl
 from .transcribe import (
+    WHISPER_MODEL,
     TranscriptionError,
     find_media,
     load_dotenv,
+    resolve_backend,
     transcribe_dir,
+    whisper_available,
 )
 
 WORK_DIRNAME = ".reelforge"
@@ -120,11 +123,20 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
         return _fail(f"no media found in {root}")
 
     out_dir = _work(root) / "transcripts"
-    print(f"transcribing {len(media)} source(s) -> {out_dir}")
+    try:
+        chosen = resolve_backend(args.backend)
+    except TranscriptionError as e:
+        return _fail(str(e))
+
+    detail = f"{chosen} ({args.model})" if chosen == "whisper" else chosen
+    print(f"transcribing {len(media)} source(s) with {detail} -> {out_dir}")
+    if chosen == "whisper":
+        print("  local backend: no upload, no key. Filler words are normalised away,")
+        print("  which weakens take selection — use scribe when choosing between takes.")
     try:
         results = transcribe_dir(
-            media, out_dir, workers=args.workers, force=args.force,
-            num_speakers=args.speakers,
+            media, out_dir, backend=args.backend, workers=args.workers,
+            force=args.force, num_speakers=args.speakers, model_size=args.model,
         )
     except TranscriptionError as e:
         return _fail(str(e))
@@ -262,6 +274,37 @@ def cmd_slot(args: argparse.Namespace) -> int:
 # --- info -------------------------------------------------------------------
 
 
+def cmd_autocut(args: argparse.Namespace) -> int:
+    from .autocut import autocut
+
+    root = Path(args.directory).resolve()
+    source = Path(args.source)
+    source = source if source.is_absolute() else root / source
+    if not source.exists():
+        return _fail(f"source not found: {source}")
+
+    try:
+        edl, stats = autocut(
+            source, platform=args.platform, noise_db=args.noise,
+            min_silence=args.min_silence, pad=args.pad, min_keep=args.min_keep,
+            reframe=args.reframe, grade=args.grade, captions=args.captions,
+        )
+    except ValueError as e:
+        return _fail(str(e))
+
+    out = Path(args.output) if args.output else root / "edl.json"
+    edl.save(out)
+    print(
+        f"{stats['source_duration']:.2f}s -> {stats['kept_duration']:.2f}s  "
+        f"({stats['removed_s']:.2f}s of dead air removed, {stats['removed_pct']:.0f}%)"
+    )
+    print(f"{stats['cuts']} span(s) kept from {stats['silences_found']} silence(s)")
+    print(f"\nwrote {out}")
+    print("  review the ranges, then: reelforge render "
+          f"{out.name} -q preview -o preview.mp4")
+    return 0
+
+
 def cmd_platforms(_: argparse.Namespace) -> int:
     print(f"{'key':<12}{'target':<24}{'canvas':<14}{'fps':<6}{'max':<8}sweet spot")
     for key, p in PLATFORMS.items():
@@ -298,18 +341,22 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"  {'ok  ' if vision else 'warn'}  {'opencv (face track)':<22}"
           f"{'available' if vision else 'missing — falls back to saliency tracking'}")
 
-    try:
-        import requests  # noqa: F401
-        asr = True
-    except ImportError:
-        asr = False
-    print(f"  {'ok  ' if asr else 'warn'}  {'requests (ASR)':<22}"
-          f"{'available' if asr else 'missing — install reelforge[transcribe]'}")
-
     import os
+
+    local = whisper_available()
+    print(f"  {'ok  ' if local else 'warn'}  {'whisper (local ASR)':<22}"
+          f"{'available — no key needed' if local else 'missing — install reelforge[local]'}")
+
     key = bool(os.environ.get("ELEVENLABS_API_KEY"))
     print(f"  {'ok  ' if key else 'warn'}  {'ELEVENLABS_API_KEY':<22}"
-          f"{'set' if key else 'unset — transcription will fail'}")
+          f"{'set — hosted Scribe available' if key else 'unset — hosted Scribe unavailable'}")
+
+    try:
+        backend = resolve_backend("auto")
+        print(f"  ok    {'transcription':<22}will use '{backend}'")
+    except TranscriptionError:
+        ok = False
+        print(f"  MISS  {'transcription':<22}no backend available")
 
     print()
     if not ok:
@@ -339,6 +386,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_init)
 
     sp = with_dir(sub.add_parser("transcribe", help="word-level ASR, cached per source"))
+    sp.add_argument(
+        "-b", "--backend", default="auto", choices=("auto", "scribe", "whisper"),
+        help="auto prefers hosted Scribe when a key is set, else local Whisper",
+    )
+    sp.add_argument(
+        "--model", default=WHISPER_MODEL,
+        choices=("tiny", "base", "small", "medium", "large-v3"),
+        help="local Whisper model size (whisper backend only)",
+    )
     sp.add_argument("-w", "--workers", type=int, default=4)
     sp.add_argument("-f", "--force", action="store_true", help="ignore the cache")
     sp.add_argument("--speakers", type=int, default=None, help="known speaker count")
@@ -375,6 +431,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--render", action="store_true", help="render the slot to WebM")
     sp.add_argument("-f", "--force", action="store_true", help="overwrite an existing slot")
     sp.set_defaults(func=cmd_slot)
+
+    sp = with_dir(sub.add_parser(
+        "autocut", help="build an EDL by trimming dead air (no transcript needed)"
+    ))
+    sp.add_argument("source", help="the clip to cut")
+    sp.add_argument("-o", "--output", help="EDL path (default: edl.json)")
+    sp.add_argument("-p", "--platform", default="reels", choices=sorted(PLATFORMS))
+    sp.add_argument("--noise", type=float, default=-32.0,
+                    help="silence threshold in dBFS (default: -32)")
+    sp.add_argument("--min-silence", type=float, default=0.35,
+                    help="shortest pause treated as a cut (default: 0.35s)")
+    sp.add_argument("--pad", type=float, default=0.08,
+                    help="silence kept either side of a span (default: 0.08s)")
+    sp.add_argument("--min-keep", type=float, default=0.30,
+                    help="discard kept spans shorter than this (default: 0.30s)")
+    sp.add_argument("--reframe", default="track",
+                    choices=("track", "static", "center", "blur_pad", "fit"))
+    sp.add_argument("--grade", default="none")
+    sp.add_argument("--captions", action="store_true",
+                    help="enable captions (needs a transcript)")
+    sp.set_defaults(func=cmd_autocut)
 
     sub.add_parser("platforms", help="list targets, styles and presets").set_defaults(
         func=cmd_platforms

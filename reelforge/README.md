@@ -40,11 +40,11 @@ violations. It reports what to fix while fixing is still cheap.
 
 ## Scope — what is and isn't here
 
-|                                       | status                                                                                                                                                                                                           |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **video-use** — the editing half      | Ported and extended, including `timeline_view`. Its automated three-pass self-eval loop is not ported; `review_cuts` gives an agent the same frames to judge from.                                               |
-| **OpenMontage** — the generation half | Image, video, speech and music generation behind a provider registry, with offline fallbacks. Not ported: avatar/lipsync, the 12-pipeline system, Backlot UI, Remotion composer, upscaling and face restoration. |
-| **HyperFrames**                       | Integrated as a bridge — scaffold, lint and render overlay slots. The 50+ registry blocks and motion-doctrine skills are not wrapped.                                                                            |
+|                                       | status                                                                                                                                                                                                                                         |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **video-use** — the editing half      | Ported and extended, including `timeline_view`. Its automated three-pass self-eval loop is not ported; `review_cuts` gives an agent the same frames to judge from.                                                                             |
+| **OpenMontage** — the generation half | Image, video, speech and music generation behind a provider registry, with offline fallbacks. Avatar/lipsync is ported (see Talking heads). Not ported: the 12-pipeline system, Backlot UI, Remotion composer, upscaling and face restoration. |
+| **HyperFrames**                       | Integrated as a bridge — scaffold, lint and render overlay slots. The 50+ registry blocks and motion-doctrine skills are not wrapped.                                                                                                          |
 
 Footage in, edited vertical video out is complete and tested. Generation reaches
 far enough to build a video from nothing — stills, motion, narration and a music
@@ -79,6 +79,55 @@ spent — assemble and time a rough cut on placeholders, then swap in real asset
 A generated still needs `still_to_clip` before it belongs on a timeline. A
 motionless still in a feed reads as a loading error; the slow push is what makes
 it read as a shot.
+
+## Talking heads
+
+A reference photo or clip plus a script becomes a video of that likeness saying
+it, in a cloned voice.
+
+```bash
+reelforge preflight                                  # which credentials work
+reelforge voice ali ~/me.wav --text "what the recording says, verbatim"
+reelforge say ali "سلام، این یک آزمایش است"          # check pronunciation first
+reelforge talking-head ~/me.mp4 "the new script" -v ali -o talking.mp4
+```
+
+Three stages, each swappable:
+
+```
+reference ─┬─ still ──→ [animate] ──┐
+           └─ video ────────────────┼─→ [lipsync] ──→ talking video
+script ────→ [voice clone] ─────────┘
+```
+
+**A video reference keeps the original body movement.** A still is animated
+first, because lipsyncing a motionless photo animates a mouth on a mannequin.
+
+**Speech is generated before any video work.** Its duration decides how long the
+driver has to be; generating video to a guessed length and finding the narration
+overruns it means paying for the video twice.
+
+**The driver is ping-pong looped, not repeated.** A lipsync provider given a 6s
+reference and 25s of audio truncates to the shorter — most of your script
+silently vanishes. Extending by plain repeat cuts from the last frame back to
+the first and jumps every cycle; reversing keeps the motion continuous.
+
+| stage             | provider                            | needs                                                          |
+| ----------------- | ----------------------------------- | -------------------------------------------------------------- |
+| voice clone + TTS | Fish Speech — hosted or self-hosted | `FISH_API_KEY`, or `FISH_BASE_URL` for a local server (no key) |
+| lipsync           | sync.so                             | `SYNC_API_KEY`                                                 |
+| animate a still   | Replicate (Kling)                   | `REPLICATE_API_TOKEN`                                          |
+
+Language is inferred from the script, not set as a parameter — Persian text in
+Persian script produces Persian, with no language flag and no transliteration
+into a neighbouring language.
+
+Hosted lipsync fetches inputs by URL rather than accepting uploads, so local
+files need `REELFORGE_PUBLIC_DIR` and `REELFORGE_PUBLIC_BASE` mapping a
+directory to a public base URL. `reelforge preflight` tells you whether that,
+and every key, is actually working — run it before building anything on top.
+
+The output is an ordinary MP4. Edit it like any other footage.
 
 ## Transitions
 

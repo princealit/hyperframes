@@ -53,7 +53,10 @@ server = MCPServer(
         "2. Existing footage, multiple takes or captions wanted: `transcribe`, "
         "`pack_takes`, read the returned transcript, `write_edl`, `lint_edl`, `render`.\n"
         "3. No footage: `generate_asset` for images/video/speech/music, "
-        "`still_to_clip` for stills, then assemble as usual.\n\n"
+        "`still_to_clip` for stills, then assemble as usual.\n"
+        "4. A reference likeness saying new words: `avatar_preflight` first, then "
+        "`clone_voice`, `speak_as` to check pronunciation, then `talking_head`. "
+        "Its output is ordinary footage \u2014 edit it like any other source.\n\n"
         "Use `timeline_view` to LOOK at footage when the transcript cannot settle a "
         "question, and `review_cuts` on a render before showing it to the user.\n\n"
         "Always confirm the plan with the user before rendering. Always run "
@@ -626,6 +629,163 @@ async def still_to_clip(
         "path": str(path),
         "duration_s": duration,
         "next": "add it to the EDL sources and reference it from a range",
+    }, indent=2)
+
+
+# --- Talking heads ----------------------------------------------------------
+
+
+@server.tool(
+    description=(
+        "Test every avatar/lipsync credential and report which actually work: "
+        "Fish (voice cloning), sync.so (lipsync), Replicate, OpenRouter, "
+        "Together, and whether local files can be exposed as URLs. Call this "
+        "FIRST — this stack has several independent providers that all fail "
+        "the same way at the point of use, and finding out here costs one call "
+        "instead of a half-built pipeline."
+    )
+)
+async def avatar_preflight() -> str:
+    from .avatar import preflight
+
+    try:
+        root = _resolve_dir(".")
+        load_dotenv(root / ".env")
+    except Exception:  # noqa: BLE001
+        pass
+    report = await anyio.to_thread.run_sync(preflight)
+    return json.dumps(report, indent=2)
+
+
+@server.tool(
+    description=(
+        "Register a voice for cloning from a reference recording. Wants 15-30s "
+        "of clean speech — more is not better, and noise or music is worse. "
+        "Supply reference_text (what the recording actually says, verbatim): "
+        "cloning is in-context, so the transcript tells the model which sounds "
+        "map to which graphemes, and quality drops noticeably without it. "
+        "Normalises and trims the audio, then saves a reusable voice profile."
+    )
+)
+async def clone_voice(
+    name: str,
+    reference_audio: str,
+    reference_text: str = "",
+    directory: str = ".",
+) -> str:
+    from .avatar import VoiceProfile, prepare_reference_audio
+
+    try:
+        root = _resolve_dir(directory)
+        src = _resolve_file(reference_audio, root)
+        voices = _work(root) / "voices"
+        prepared = await anyio.to_thread.run_sync(
+            lambda: prepare_reference_audio(src, voices / f"{name}.wav")
+        )
+        voice = VoiceProfile(
+            name=name, reference_audio=prepared, reference_text=reference_text
+        )
+        path = voice.save(voices / f"{name}.json")
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    from .ffmpeg import media_duration
+
+    return json.dumps({
+        "voice": name,
+        "profile": str(path),
+        "reference_seconds": round(media_duration(prepared), 2),
+        "has_transcript": bool(reference_text),
+        "warning": (
+            None if reference_text else
+            "no reference_text given — the clone will be measurably worse"
+        ),
+        "next": "call speak_as to test it, or talking_head to make a video",
+    }, indent=2)
+
+
+@server.tool(
+    description=(
+        "Speak text in a cloned voice and return the audio path. Language is "
+        "inferred from the script itself rather than set as a parameter, so "
+        "Persian text in Persian script produces Persian — no language flag and "
+        "no transliteration into a neighbouring language. Use this to check "
+        "pronunciation before spending anything on video."
+    )
+)
+async def speak_as(
+    voice: str,
+    text: str,
+    directory: str = ".",
+    output: str | None = None,
+    model: str = "s1",
+) -> str:
+    from .avatar import VoiceProfile, speak
+    from .ffmpeg import media_duration
+
+    try:
+        root = _resolve_dir(directory)
+        load_dotenv(root / ".env")
+        profile = VoiceProfile.load(_work(root) / "voices" / f"{voice}.json")
+        out = Path(output) if output else _work(root) / "voices" / f"{voice}_take.wav"
+        out = out if out.is_absolute() else root / out
+        await anyio.to_thread.run_sync(lambda: speak(text, profile, out, model=model))
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    return json.dumps({
+        "audio": str(out),
+        "duration_s": round(media_duration(out), 2),
+        "voice": voice,
+    }, indent=2)
+
+
+@server.tool(
+    description=(
+        "Turn a reference photo or video plus a script into a video of that "
+        "likeness speaking it, in a cloned voice. A video reference keeps the "
+        "original body movement; a still is animated first, because lipsyncing "
+        "a motionless photo animates a mouth on a mannequin. Speech is "
+        "generated before any video work so the driver can be sized to it "
+        "rather than truncating the script. Output is an ordinary MP4 that "
+        "feeds straight into autocut/render."
+    )
+)
+async def talking_head(
+    reference: str,
+    script: str,
+    voice: str,
+    directory: str = ".",
+    output: str = "talking.mp4",
+    animate_seconds: float = 5.0,
+) -> str:
+    from .avatar import VoiceProfile
+    from .avatar import talking_head as run_talking_head
+
+    try:
+        root = _resolve_dir(directory)
+        load_dotenv(root / ".env")
+        ref = _resolve_file(reference, root)
+        profile = VoiceProfile.load(_work(root) / "voices" / f"{voice}.json")
+        out = Path(output)
+        out = out if out.is_absolute() else root / out
+        result = await anyio.to_thread.run_sync(
+            lambda: run_talking_head(
+                ref, script, profile, out,
+                work_dir=_work(root) / "avatars",
+                animate_seconds=animate_seconds, verbose=False,
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    return json.dumps({
+        "output": str(result.output),
+        "reference_kind": result.reference_kind,
+        "duration_s": round(result.duration, 2),
+        "voice": result.voice,
+        "steps": result.steps,
+        "next": "treat this as source footage — autocut, reframe and render it",
     }, indent=2)
 
 

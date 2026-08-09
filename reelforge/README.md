@@ -83,7 +83,38 @@ it read as a shot.
 ## Talking heads
 
 A reference photo or clip plus a script becomes a video of that likeness saying
-it, in a cloned voice.
+it, in a cloned voice. **Two paths — one verified live, one not.**
+
+### Higgsfield (verified)
+
+Run end to end against the live API: a photo plus a cloned Persian voice
+produced a 9:16 talking video for **7.7 credits** in two calls.
+
+The collapse is the point. Higgsfield's `wan2_7` takes an `audio_references`
+role alongside `start_image`, so motion and lipsync happen in one generation —
+no separate animate stage, no separate lipsync stage, and no driver-extension
+problem, because the model generates as many frames as the audio needs.
+
+```
+script ──→ [generate_audio: cloned voice] ──┐
+                                             ├──→ [wan2_7] ──→ talking video
+photo ───────────────────────────────────────┘
+```
+
+Driven over MCP: `plan_talking_head` costs the job before spending anything,
+you execute the two Higgsfield calls, then `assemble_talking_head` downloads
+the result and hands back an EDL. From there it is ordinary footage.
+
+Scripts over 15s are split on sentence boundaries — a seam inside a clause
+reads as a glitch, a sentence boundary already carries a pause.
+
+### Fish + sync.so (unverified)
+
+The self-hostable path, in `avatar.py`. Three stages instead of two, and
+**never executed against a live endpoint** — every host was unreachable from
+the environment it was written in. The sync.so request shape in particular is a
+reconstruction; it is declared as data in `SYNC_SHAPE` so a mismatch is a
+one-line fix. Run `reelforge preflight` before relying on it.
 
 ```bash
 reelforge preflight                                  # which credentials work

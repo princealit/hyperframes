@@ -789,6 +789,95 @@ async def talking_head(
     }, indent=2)
 
 
+# --- Higgsfield talking heads (verified path) --------------------------------
+
+
+@server.tool(
+    description=(
+        "Plan and cost a talking head on Higgsfield BEFORE spending any credits. "
+        "Returns the exact generate_audio / generate_video calls to make, in "
+        "order, with a credit estimate. This is the VERIFIED path — photo + "
+        "cloned voice + script becomes a talking video in two calls, because "
+        "wan2_7 takes the audio as a reference and does motion and lipsync in "
+        "one generation. Show the user the cost before executing. Get voice_id "
+        "from Higgsfield list_voices (prefer voice_type 'element' — a cloned "
+        "voice) and image_media_id from show_medias."
+    )
+)
+async def plan_talking_head(
+    script: str,
+    voice_id: str,
+    image_media_id: str,
+    aspect_ratio: str = "9:16",
+    resolution: str = "720p",
+) -> str:
+    from .higgsfield import plan as build_plan
+
+    try:
+        p = build_plan(
+            script, voice_id, image_media_id,
+            aspect_ratio=aspect_ratio, resolution=resolution,
+        )
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    return json.dumps({
+        "summary": p.summary(),
+        "estimated_credits": round(p.est_credits, 2),
+        "segments": p.segments,
+        "calls": [
+            {"tool": c.tool, "params": c.params, "purpose": c.purpose,
+             "est_credits": round(c.est_credits, 2)}
+            for c in p.calls
+        ],
+        "notes": p.notes,
+        "how": (
+            "Run call 1 (generate_audio) via the Higgsfield MCP, wait with "
+            "jobs_wait, then substitute its job_id into call 2's "
+            "audio_references before running it. Finally pass the result URLs "
+            "to assemble_talking_head."
+        ),
+    }, indent=2, ensure_ascii=False)
+
+
+@server.tool(
+    description=(
+        "Download finished Higgsfield talking-head segments and assemble them "
+        "into an EDL. After this the talking head is ordinary footage — caption "
+        "it, grade it, cut other shots against it, lint and render it like any "
+        "other source. Verifies each download is real playable media rather "
+        "than an error page saved with a .mp4 name."
+    )
+)
+async def assemble_talking_head(
+    result_urls: list[str],
+    directory: str = ".",
+    output: str = "talking.edl.json",
+    platform: str = "reels",
+) -> str:
+    from .higgsfield import collect, to_edl
+
+    try:
+        root = _resolve_dir(directory)
+        segs = await anyio.to_thread.run_sync(
+            lambda: collect(result_urls, _work(root) / "avatars")
+        )
+        edl = to_edl(segs, root, platform=platform)
+        out = root / output
+        out.write_text(json.dumps(edl, indent=2) + "\n")
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    from .ffmpeg import media_duration
+
+    return json.dumps({
+        "edl": str(out),
+        "segments": [str(s) for s in segs],
+        "total_duration_s": round(sum(media_duration(s) for s in segs), 2),
+        "next": "lint_edl then render — or write_edl first to cut it further",
+    }, indent=2)
+
+
 # --- Motion graphics --------------------------------------------------------
 
 

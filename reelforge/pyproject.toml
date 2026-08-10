@@ -15,6 +15,8 @@ dependencies = [
 vision = ["opencv-python-headless>=4.8,<5"]
 # Hosted word-level ASR (ElevenLabs Scribe).
 transcribe = ["requests>=2.31"]
+# Pull footage from YouTube, TikTok, Instagram and friends.
+source = ["yt-dlp>=2024.1"]
 # Local word-level ASR. No API key, nothing leaves the machine.
 local = ["faster-whisper>=1.0"]
 # Expose the pipeline as MCP tools for Claude Code / Claude Desktop.
@@ -30,6 +32,7 @@ all = [
     "anyio>=4.0",
     "uvicorn>=0.30",
     "starlette>=0.37",
+    "yt-dlp>=2024.1",
 ]
 
 [project.scripts]

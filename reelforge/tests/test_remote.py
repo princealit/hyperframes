@@ -160,3 +160,43 @@ def test_health_needs_no_credential():
 def test_the_rejection_says_what_to_send():
     r = _middleware_response("s" * 32, None)
     assert "Bearer" in r.json()["error"]
+
+
+# --- source detection -------------------------------------------------------
+
+
+def test_watch_pages_are_routed_to_yt_dlp():
+    """curl on a YouTube link saves the watch page's HTML as an .mp4.
+
+    That download reports success and only fails much later, at render, where
+    the cause is invisible — so the downloader has to be chosen by host.
+    """
+    for url in [
+        "https://www.youtube.com/watch?v=abc123",
+        "https://youtu.be/abc123",
+        "https://www.tiktok.com/@someone/video/123",
+        "https://www.instagram.com/reel/abc/",
+        "https://vimeo.com/12345",
+        "https://x.com/someone/status/123",
+    ]:
+        assert srv._is_page_url(url), url
+
+
+def test_direct_media_links_are_fetched_with_curl():
+    for url in [
+        "https://cdn.example.com/clip.mp4",
+        "https://storage.googleapis.com/bucket/take1.mov",
+        "https://d8j0ntlcm91z4.cloudfront.net/user/gen.mp4",
+    ]:
+        assert not srv._is_page_url(url), url
+
+
+def test_subdomains_of_a_page_host_still_match():
+    assert srv._is_page_url("https://m.youtube.com/watch?v=x")
+    assert srv._is_page_url("https://www.youtube.com/shorts/x")
+
+
+def test_a_lookalike_domain_does_not_match():
+    """Substring matching would route youtube.com.evil.example to yt-dlp."""
+    assert not srv._is_page_url("https://youtube.com.evil.example/clip.mp4")
+    assert not srv._is_page_url("https://notyoutube.com/clip.mp4")

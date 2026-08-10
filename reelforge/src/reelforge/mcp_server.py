@@ -133,6 +133,34 @@ def _resolve_file(path: str, base: Path | None = None) -> Path:
     return p
 
 
+#: Hosts that serve a watch page at the URL you copy rather than a media file.
+#: Matched on the registrable domain, not a substring, so a direct CDN link that
+#: merely mentions one of these names is still fetched with curl.
+PAGE_HOSTS = frozenset({
+    "youtube.com", "youtu.be", "tiktok.com", "instagram.com", "vimeo.com",
+    "twitter.com", "x.com", "facebook.com", "reddit.com", "twitch.tv",
+    "dailymotion.com", "linkedin.com",
+})
+
+
+def _is_page_url(url: str) -> bool:
+    """Does this URL serve a watch page rather than a media file?
+
+    The distinction decides the downloader. curl on a YouTube link saves the
+    HTML of the watch page under an .mp4 name, which passes as a successful
+    download and only fails much later during render.
+    """
+    import urllib.parse
+
+    host = urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+    host = host.removeprefix("www.").removeprefix("m.")
+    parts = host.split(".")
+    # Compare the registrable domain so subdomains match but lookalike
+    # domains (youtube.com.evil.example) do not.
+    registrable = ".".join(parts[-2:]) if len(parts) >= 2 else host
+    return registrable in PAGE_HOSTS
+
+
 def _err(e: Exception) -> str:
     """Render an exception as something an agent can act on."""
     if isinstance(e, EDLError):
@@ -841,8 +869,11 @@ async def talking_head(
 
 @server.tool(
     description=(
-        "Pull a video, image or audio file from a URL into the workspace so it "
-        "can be edited. This is how footage reaches a HOSTED reelforge — a "
+        "Pull a video, image or audio file into the workspace so it can be edited. "
+        "Takes a direct file link OR a YouTube / TikTok / Instagram / Vimeo / X "
+        "page URL (yt-dlp resolves the stream, capped at 1080p). Use it to grab "
+        "b-roll and reference footage, and as the way footage reaches a HOSTED "
+        "reelforge — a "
         "phone has no shared filesystem with the server, so a share link "
         "(Drive, Dropbox, iCloud, S3, any direct link) is the way in. Returns "
         "the local name to use in later tools. Running locally over stdio you "
@@ -870,14 +901,44 @@ async def import_media(url: str, directory: str = ".", name: str | None = None) 
             safe += ".mp4"
         dest = _confine((root / safe).resolve())
 
-        result = await anyio.to_thread.run_sync(
-            lambda: subprocess.run(
-                ["curl", "-fsSL", "--max-time", "1800", "-o", str(dest), url],
-                capture_output=True, text=True,
+        # A page URL is not a file URL. YouTube, TikTok, Instagram and the rest
+        # serve HTML at the address you copy, so curl would faithfully save a
+        # web page named .mp4 — which only fails later, at render, where the
+        # cause is invisible. yt-dlp resolves the actual stream.
+        if _is_page_url(url):
+            if shutil.which("yt-dlp") is None:
+                raise RuntimeError(
+                    f"{parsed.netloc} serves a web page, not a video file. "
+                    "Install yt-dlp to pull from it: pip install yt-dlp"
+                )
+            result = await anyio.to_thread.run_sync(
+                lambda: subprocess.run(
+                    [
+                        "yt-dlp",
+                        # Cap at 1080p: a 4K source costs minutes of extra
+                        # download and encode for a 1080x1920 delivery target.
+                        "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+                        "--merge-output-format", "mp4",
+                        "--no-playlist", "-o", str(dest), url,
+                    ],
+                    capture_output=True, text=True,
+                )
             )
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"download failed: {result.stderr[:200] or 'curl error'}")
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"yt-dlp failed: {(result.stderr or '').strip()[:300]}"
+                )
+        else:
+            result = await anyio.to_thread.run_sync(
+                lambda: subprocess.run(
+                    ["curl", "-fsSL", "--max-time", "1800", "-o", str(dest), url],
+                    capture_output=True, text=True,
+                )
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"download failed: {result.stderr[:200] or 'curl error'}"
+                )
 
         # Verify it is real media before reporting success — an HTML error page
         # saved as .mp4 only fails later, during render, where the cause is far

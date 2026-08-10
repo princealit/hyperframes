@@ -284,6 +284,44 @@ cut, rather than one parsing stdout.
 
 Or drive it as a plain skill instead — see [`SKILL.md`](SKILL.md).
 
+## Remote connector — one hookup, every Claude surface
+
+Over stdio, reelforge is a local tool: Claude Code and Claude Desktop launch it
+on your machine. That is the right shape for editing, because your footage is
+on your disk — but it cannot reach claude.ai in a browser or on a phone, which
+can only talk to servers on the internet.
+
+The same server speaks HTTP:
+
+```bash
+export REELFORGE_AUTH_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+reelforge-mcp --transport streamable-http --port 8080 --workspace ~/reelforge-workspace
+```
+
+Put it behind HTTPS, add it once in Settings → Connectors as a custom connector
+with the bearer token, and it appears in **web, desktop and mobile** together.
+
+Two things change when the transport does, and both are enforced, not advised:
+
+**A bearer token is required.** These tools spend credits and run ffmpeg. A
+server that started without a token and quietly accepted everything would be
+worse than one that refuses to start, so it refuses to start. Comparison is
+constant-time.
+
+**Every path is confined to one workspace.** Over stdio the `directory`
+argument comes from the user's own machine and their filesystem is the right
+scope. Over HTTP it arrives from the network, and unconfined it is a filesystem
+read primitive. Paths resolve _before_ the check, so `..` and symlinks are
+collapsed first and cannot escape.
+
+Health is served at `/health` without a credential, so uptime checks do not
+need the secret.
+
+What still needs a real machine: the workspace must hold your footage. The
+talking-head flow does not — the photo and voice live on Higgsfield and the
+result comes back as a URL — so that path works from a phone with nothing local
+at all.
+
 ## The EDL
 
 The only artifact the agent writes. Everything else is derived.

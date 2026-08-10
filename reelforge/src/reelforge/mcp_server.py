@@ -65,12 +65,56 @@ server = MCPServer(
 )
 
 
+#: Set when serving over HTTP. Every path the tools resolve is confined beneath
+#: it. Unset (the default) means stdio on someone's own machine, where the
+#: user's own filesystem is exactly the right scope and a jail would only get in
+#: the way.
+_WORKSPACE_ROOT: Path | None = None
+
+
+def set_workspace_root(root: Path | None) -> None:
+    """Confine all path resolution beneath `root`, or lift the confinement.
+
+    Called by `main` when a transport other than stdio is selected. It is the
+    difference between a tool that reads the operator's disk and one that reads
+    only what was handed to it: over HTTP the `directory` argument arrives from
+    the network, so without this it is a filesystem read primitive.
+    """
+    global _WORKSPACE_ROOT
+    _WORKSPACE_ROOT = root.expanduser().resolve() if root else None
+
+
+def _confine(p: Path) -> Path:
+    """Reject a resolved path that escapes the workspace root.
+
+    Resolution happens before the check so `..` and symlinks are already
+    collapsed — checking the raw string would be trivially defeated by
+    `workspace/../../etc`.
+    """
+    if _WORKSPACE_ROOT is None:
+        return p
+    try:
+        p.relative_to(_WORKSPACE_ROOT)
+    except ValueError:
+        raise ValueError(
+            f"{p} is outside the workspace. This server confines file access to "
+            f"{_WORKSPACE_ROOT}; use a path inside it."
+        ) from None
+    return p
+
+
 def _work(root: Path) -> Path:
     return root / WORK_DIRNAME
 
 
 def _resolve_dir(directory: str) -> Path:
-    p = Path(directory).expanduser().resolve()
+    base = _WORKSPACE_ROOT
+    p = Path(directory).expanduser()
+    # A relative path is relative to the workspace when there is one, so
+    # `directory="."` means the workspace rather than the server's cwd.
+    if base is not None and not p.is_absolute():
+        p = base / p
+    p = _confine(p.resolve())
     if not p.is_dir():
         raise ValueError(f"not a directory: {p}")
     return p
@@ -78,9 +122,11 @@ def _resolve_dir(directory: str) -> Path:
 
 def _resolve_file(path: str, base: Path | None = None) -> Path:
     p = Path(path).expanduser()
-    if not p.is_absolute() and base is not None:
-        p = base / p
-    p = p.resolve()
+    if not p.is_absolute():
+        anchor = base or _WORKSPACE_ROOT
+        if anchor is not None:
+            p = anchor / p
+    p = _confine(p.resolve())
     if not p.exists():
         raise FileNotFoundError(f"not found: {p}")
     return p
@@ -961,9 +1007,102 @@ async def render_overlay_slot(
     }, indent=2)
 
 
+def _auth_middleware(token: str):
+    """Reject requests without the shared bearer token.
+
+    A remote MCP server is a URL anyone can POST to, and these tools spend
+    credits, read files and run ffmpeg. The token is the whole boundary, so it
+    is required rather than optional — a server that starts without one and
+    quietly accepts everything is worse than one that refuses to start.
+
+    Compared with `secrets.compare_digest` so a wrong token takes the same time
+    to reject regardless of how much of it was right.
+    """
+    import secrets
+
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    class BearerAuth(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            # Health checks must not need a credential, or every uptime monitor
+            # and load balancer needs the secret just to ask if the port is up.
+            if request.url.path in ("/health", "/healthz"):
+                return JSONResponse({"ok": True, "service": "reelforge"})
+
+            header = request.headers.get("authorization", "")
+            offered = header[7:] if header.lower().startswith("bearer ") else ""
+            if not secrets.compare_digest(offered, token):
+                return JSONResponse(
+                    {"error": "unauthorized — send 'Authorization: Bearer <token>'"},
+                    status_code=401,
+                )
+            return await call_next(request)
+
+    return BearerAuth
+
+
 def main() -> None:
-    """Entry point for `reelforge-mcp`."""
-    server.run("stdio")
+    """Entry point for `reelforge-mcp`.
+
+    Two shapes, one server. Over stdio it is a local tool launched by Claude
+    Code or Claude Desktop, with the user's own filesystem as its scope. Over
+    HTTP it is a remote connector reachable from claude.ai — including phones —
+    and everything it can touch is confined to one workspace directory behind a
+    bearer token.
+    """
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(
+        prog="reelforge-mcp",
+        description="Serve reelforge's pipeline as MCP tools.",
+    )
+    parser.add_argument(
+        "--transport", default="stdio",
+        choices=["stdio", "streamable-http", "sse"],
+        help="stdio for a local client; streamable-http for a remote connector",
+    )
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--workspace",
+        help="directory all file access is confined to (HTTP transports). "
+             "Defaults to REELFORGE_WORKSPACE, then ./workspace",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "stdio":
+        server.run("stdio")
+        return
+
+    workspace = Path(
+        args.workspace or os.environ.get("REELFORGE_WORKSPACE") or "./workspace"
+    ).expanduser().resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+    set_workspace_root(workspace)
+
+    token = os.environ.get("REELFORGE_AUTH_TOKEN", "")
+    if not token:
+        raise SystemExit(
+            "REELFORGE_AUTH_TOKEN is required for network transports.\n"
+            "These tools spend credits and run ffmpeg — an open endpoint is not "
+            "a safe default.\n\n"
+            "  export REELFORGE_AUTH_TOKEN=\"$(python3 -c "
+            "'import secrets;print(secrets.token_urlsafe(32))')\""
+        )
+    if len(token) < 16:
+        raise SystemExit("REELFORGE_AUTH_TOKEN is too short — use 32+ characters")
+
+    app = server.streamable_http_app()
+    app.add_middleware(_auth_middleware(token))
+
+    import uvicorn
+
+    print(f"reelforge {__version__} — {args.transport} on {args.host}:{args.port}")
+    print(f"  workspace  {workspace}  (all file access confined here)")
+    print(f"  auth       bearer token, {len(token)} chars")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

@@ -284,7 +284,41 @@ cut, rather than one parsing stdout.
 
 Or drive it as a plain skill instead — see [`SKILL.md`](SKILL.md).
 
-## Remote connector — one hookup, every Claude surface
+## Hosted connector — appears in Claude's Connectors list
+
+Every connector already in that list — Higgsfield, Canva, Drive — is a server
+with a public URL. Nothing about them is special: that is the whole requirement.
+Deploy reelforge the same way and it joins them, addable once and usable from
+web, desktop and phone together.
+
+```bash
+docker build -t reelforge .
+docker run -p 8080:8080 -e REELFORGE_AUTH_TOKEN="$(openssl rand -hex 32)" reelforge
+```
+
+Or one-click on Render with the included `render.yaml`. Then in Claude:
+**+ → Connectors → Add custom connector**, URL `https://<host>/mcp`, header
+`Authorization: Bearer <token>`.
+
+Two tools exist for the hosted case, because a phone shares no filesystem with
+a server:
+
+- **`import_media`** pulls footage in from any share link (Drive, Dropbox, S3).
+  The filename is derived safely rather than taken from the URL, and the
+  download is probed before success is reported — an HTML error page saved as
+  `.mp4` otherwise fails much later, during render, where the cause is hidden.
+- **`list_workspace`** lists what is there with a download link for each file.
+  That link is how a finished render actually reaches you; the workspace is
+  served at `/files` behind the same bearer token.
+
+Verified end to end: URL in, workspace, download link out — 200 with the token,
+401 without.
+
+Sizing matters. Encoding is CPU-bound and memory-hungry, and a free tier will
+boot and then die partway through the first render, which is worse than not
+deploying.
+
+## Remote connector — running it yourself
 
 Over stdio, reelforge is a local tool: Claude Code and Claude Desktop launch it
 on your machine. That is the right shape for editing, because your footage is

@@ -27,6 +27,7 @@ or in `claude_desktop_config.json` / `.mcp.json`:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -835,6 +836,122 @@ async def talking_head(
     }, indent=2)
 
 
+# --- Getting media in and out of a hosted workspace --------------------------
+
+
+@server.tool(
+    description=(
+        "Pull a video, image or audio file from a URL into the workspace so it "
+        "can be edited. This is how footage reaches a HOSTED reelforge — a "
+        "phone has no shared filesystem with the server, so a share link "
+        "(Drive, Dropbox, iCloud, S3, any direct link) is the way in. Returns "
+        "the local name to use in later tools. Running locally over stdio you "
+        "usually do not need this: just point at the folder."
+    )
+)
+async def import_media(url: str, directory: str = ".", name: str | None = None) -> str:
+    import subprocess
+    import urllib.parse
+
+    from .ffmpeg import probe
+
+    try:
+        root = _resolve_dir(directory)
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"need an http(s) URL, got {parsed.scheme or 'no scheme'}")
+
+        # Derive a safe filename rather than trusting the URL's path: a remote
+        # string must never decide where a file lands on disk.
+        stem = Path(urllib.parse.unquote(parsed.path)).name or "import"
+        filename = name or stem
+        safe = "".join(c for c in filename if c.isalnum() or c in "._-") or "import"
+        if "." not in safe:
+            safe += ".mp4"
+        dest = _confine((root / safe).resolve())
+
+        result = await anyio.to_thread.run_sync(
+            lambda: subprocess.run(
+                ["curl", "-fsSL", "--max-time", "1800", "-o", str(dest), url],
+                capture_output=True, text=True,
+            )
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"download failed: {result.stderr[:200] or 'curl error'}")
+
+        # Verify it is real media before reporting success — an HTML error page
+        # saved as .mp4 only fails later, during render, where the cause is far
+        # harder to see.
+        info = await anyio.to_thread.run_sync(probe, dest)
+        if info.duration <= 0:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError("downloaded file is not playable media")
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    w, h = info.display_size
+    return json.dumps({
+        "imported": safe,
+        "path": str(dest),
+        "size": f"{w}x{h}",
+        "duration_s": round(info.duration, 2),
+        "has_audio": info.has_audio,
+        "size_mb": round(dest.stat().st_size / 1_048_576, 1),
+        "next": "probe_media or autocut it like any other source",
+    }, indent=2)
+
+
+@server.tool(
+    description=(
+        "List what is in the workspace, with a download link for each file when "
+        "the server is hosted. Use this to find footage you imported earlier, "
+        "and to get the finished render back out — on a hosted server the "
+        "output MP4 lives on the server, so this link is how you actually "
+        "receive it."
+    )
+)
+async def list_workspace(directory: str = ".", pattern: str = "*") -> str:
+    from .ffmpeg import probe
+
+    try:
+        root = _resolve_dir(directory)
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    base = os.environ.get("REELFORGE_PUBLIC_URL", "").rstrip("/")
+    files: list[dict[str, Any]] = []
+    for p in sorted(root.glob(pattern)):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        entry: dict[str, Any] = {
+            "name": p.name,
+            "size_mb": round(p.stat().st_size / 1_048_576, 2),
+        }
+        if p.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm", ".wav", ".mp3", ".m4a"):
+            try:
+                info = probe(p)
+                entry["duration_s"] = round(info.duration, 2)
+            except Exception:  # noqa: BLE001 — a listing should not fail on one bad file
+                entry["duration_s"] = None
+        if base and _WORKSPACE_ROOT is not None:
+            try:
+                rel = p.resolve().relative_to(_WORKSPACE_ROOT).as_posix()
+                entry["download"] = f"{base}/files/{rel}"
+            except ValueError:
+                pass
+        files.append(entry)
+
+    return json.dumps({
+        "workspace": str(root),
+        "files": files,
+        "note": (
+            None if base else
+            "set REELFORGE_PUBLIC_URL to the server's public address to get "
+            "download links for finished renders"
+        ),
+    }, indent=2)
+
+
 # --- Higgsfield talking heads (verified path) --------------------------------
 
 
@@ -1095,6 +1212,16 @@ def main() -> None:
         raise SystemExit("REELFORGE_AUTH_TOKEN is too short — use 32+ characters")
 
     app = server.streamable_http_app()
+
+    # Serve the workspace so finished renders can actually be retrieved. On a
+    # hosted server the output MP4 has nowhere else to go — without this the
+    # tool renders a file the user can never receive. Mounted BEFORE the auth
+    # middleware is added so it sits behind the same token.
+    from starlette.staticfiles import StaticFiles
+
+    app.router.mount(
+        "/files", StaticFiles(directory=str(workspace)), name="files"
+    )
     app.add_middleware(_auth_middleware(token))
 
     import uvicorn

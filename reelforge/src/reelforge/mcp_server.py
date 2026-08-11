@@ -27,6 +27,7 @@ or in `claude_desktop_config.json` / `.mcp.json`:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -53,7 +54,10 @@ server = MCPServer(
         "2. Existing footage, multiple takes or captions wanted: `transcribe`, "
         "`pack_takes`, read the returned transcript, `write_edl`, `lint_edl`, `render`.\n"
         "3. No footage: `generate_asset` for images/video/speech/music, "
-        "`still_to_clip` for stills, then assemble as usual.\n\n"
+        "`still_to_clip` for stills, then assemble as usual.\n"
+        "4. A reference likeness saying new words: `avatar_preflight` first, then "
+        "`clone_voice`, `speak_as` to check pronunciation, then `talking_head`. "
+        "Its output is ordinary footage \u2014 edit it like any other source.\n\n"
         "Use `timeline_view` to LOOK at footage when the transcript cannot settle a "
         "question, and `review_cuts` on a render before showing it to the user.\n\n"
         "Always confirm the plan with the user before rendering. Always run "
@@ -62,12 +66,56 @@ server = MCPServer(
 )
 
 
+#: Set when serving over HTTP. Every path the tools resolve is confined beneath
+#: it. Unset (the default) means stdio on someone's own machine, where the
+#: user's own filesystem is exactly the right scope and a jail would only get in
+#: the way.
+_WORKSPACE_ROOT: Path | None = None
+
+
+def set_workspace_root(root: Path | None) -> None:
+    """Confine all path resolution beneath `root`, or lift the confinement.
+
+    Called by `main` when a transport other than stdio is selected. It is the
+    difference between a tool that reads the operator's disk and one that reads
+    only what was handed to it: over HTTP the `directory` argument arrives from
+    the network, so without this it is a filesystem read primitive.
+    """
+    global _WORKSPACE_ROOT
+    _WORKSPACE_ROOT = root.expanduser().resolve() if root else None
+
+
+def _confine(p: Path) -> Path:
+    """Reject a resolved path that escapes the workspace root.
+
+    Resolution happens before the check so `..` and symlinks are already
+    collapsed — checking the raw string would be trivially defeated by
+    `workspace/../../etc`.
+    """
+    if _WORKSPACE_ROOT is None:
+        return p
+    try:
+        p.relative_to(_WORKSPACE_ROOT)
+    except ValueError:
+        raise ValueError(
+            f"{p} is outside the workspace. This server confines file access to "
+            f"{_WORKSPACE_ROOT}; use a path inside it."
+        ) from None
+    return p
+
+
 def _work(root: Path) -> Path:
     return root / WORK_DIRNAME
 
 
 def _resolve_dir(directory: str) -> Path:
-    p = Path(directory).expanduser().resolve()
+    base = _WORKSPACE_ROOT
+    p = Path(directory).expanduser()
+    # A relative path is relative to the workspace when there is one, so
+    # `directory="."` means the workspace rather than the server's cwd.
+    if base is not None and not p.is_absolute():
+        p = base / p
+    p = _confine(p.resolve())
     if not p.is_dir():
         raise ValueError(f"not a directory: {p}")
     return p
@@ -75,12 +123,42 @@ def _resolve_dir(directory: str) -> Path:
 
 def _resolve_file(path: str, base: Path | None = None) -> Path:
     p = Path(path).expanduser()
-    if not p.is_absolute() and base is not None:
-        p = base / p
-    p = p.resolve()
+    if not p.is_absolute():
+        anchor = base or _WORKSPACE_ROOT
+        if anchor is not None:
+            p = anchor / p
+    p = _confine(p.resolve())
     if not p.exists():
         raise FileNotFoundError(f"not found: {p}")
     return p
+
+
+#: Hosts that serve a watch page at the URL you copy rather than a media file.
+#: Matched on the registrable domain, not a substring, so a direct CDN link that
+#: merely mentions one of these names is still fetched with curl.
+PAGE_HOSTS = frozenset({
+    "youtube.com", "youtu.be", "tiktok.com", "instagram.com", "vimeo.com",
+    "twitter.com", "x.com", "facebook.com", "reddit.com", "twitch.tv",
+    "dailymotion.com", "linkedin.com",
+})
+
+
+def _is_page_url(url: str) -> bool:
+    """Does this URL serve a watch page rather than a media file?
+
+    The distinction decides the downloader. curl on a YouTube link saves the
+    HTML of the watch page under an .mp4 name, which passes as a successful
+    download and only fails much later during render.
+    """
+    import urllib.parse
+
+    host = urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+    host = host.removeprefix("www.").removeprefix("m.")
+    parts = host.split(".")
+    # Compare the registrable domain so subdomains match but lookalike
+    # domains (youtube.com.evil.example) do not.
+    registrable = ".".join(parts[-2:]) if len(parts) >= 2 else host
+    return registrable in PAGE_HOSTS
 
 
 def _err(e: Exception) -> str:
@@ -629,6 +707,401 @@ async def still_to_clip(
     }, indent=2)
 
 
+# --- Talking heads ----------------------------------------------------------
+
+
+@server.tool(
+    description=(
+        "Test every avatar/lipsync credential and report which actually work: "
+        "Fish (voice cloning), sync.so (lipsync), Replicate, OpenRouter, "
+        "Together, and whether local files can be exposed as URLs. Call this "
+        "FIRST — this stack has several independent providers that all fail "
+        "the same way at the point of use, and finding out here costs one call "
+        "instead of a half-built pipeline."
+    )
+)
+async def avatar_preflight() -> str:
+    from .avatar import preflight
+
+    try:
+        root = _resolve_dir(".")
+        load_dotenv(root / ".env")
+    except Exception:  # noqa: BLE001
+        pass
+    report = await anyio.to_thread.run_sync(preflight)
+    return json.dumps(report, indent=2)
+
+
+@server.tool(
+    description=(
+        "Register a voice for cloning from a reference recording. Wants 15-30s "
+        "of clean speech — more is not better, and noise or music is worse. "
+        "Supply reference_text (what the recording actually says, verbatim): "
+        "cloning is in-context, so the transcript tells the model which sounds "
+        "map to which graphemes, and quality drops noticeably without it. "
+        "Normalises and trims the audio, then saves a reusable voice profile."
+    )
+)
+async def clone_voice(
+    name: str,
+    reference_audio: str,
+    reference_text: str = "",
+    directory: str = ".",
+) -> str:
+    from .avatar import VoiceProfile, prepare_reference_audio
+
+    try:
+        root = _resolve_dir(directory)
+        src = _resolve_file(reference_audio, root)
+        voices = _work(root) / "voices"
+        prepared = await anyio.to_thread.run_sync(
+            lambda: prepare_reference_audio(src, voices / f"{name}.wav")
+        )
+        voice = VoiceProfile(
+            name=name, reference_audio=prepared, reference_text=reference_text
+        )
+        path = voice.save(voices / f"{name}.json")
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    from .ffmpeg import media_duration
+
+    return json.dumps({
+        "voice": name,
+        "profile": str(path),
+        "reference_seconds": round(media_duration(prepared), 2),
+        "has_transcript": bool(reference_text),
+        "warning": (
+            None if reference_text else
+            "no reference_text given — the clone will be measurably worse"
+        ),
+        "next": "call speak_as to test it, or talking_head to make a video",
+    }, indent=2)
+
+
+@server.tool(
+    description=(
+        "Speak text in a cloned voice and return the audio path. Language is "
+        "inferred from the script itself rather than set as a parameter, so "
+        "Persian text in Persian script produces Persian — no language flag and "
+        "no transliteration into a neighbouring language. Use this to check "
+        "pronunciation before spending anything on video."
+    )
+)
+async def speak_as(
+    voice: str,
+    text: str,
+    directory: str = ".",
+    output: str | None = None,
+    model: str = "s1",
+) -> str:
+    from .avatar import VoiceProfile, speak
+    from .ffmpeg import media_duration
+
+    try:
+        root = _resolve_dir(directory)
+        load_dotenv(root / ".env")
+        profile = VoiceProfile.load(_work(root) / "voices" / f"{voice}.json")
+        out = Path(output) if output else _work(root) / "voices" / f"{voice}_take.wav"
+        out = out if out.is_absolute() else root / out
+        await anyio.to_thread.run_sync(lambda: speak(text, profile, out, model=model))
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    return json.dumps({
+        "audio": str(out),
+        "duration_s": round(media_duration(out), 2),
+        "voice": voice,
+    }, indent=2)
+
+
+@server.tool(
+    description=(
+        "Turn a reference photo or video plus a script into a video of that "
+        "likeness speaking it, in a cloned voice. A video reference keeps the "
+        "original body movement; a still is animated first, because lipsyncing "
+        "a motionless photo animates a mouth on a mannequin. Speech is "
+        "generated before any video work so the driver can be sized to it "
+        "rather than truncating the script. Output is an ordinary MP4 that "
+        "feeds straight into autocut/render."
+    )
+)
+async def talking_head(
+    reference: str,
+    script: str,
+    voice: str,
+    directory: str = ".",
+    output: str = "talking.mp4",
+    animate_seconds: float = 5.0,
+) -> str:
+    from .avatar import VoiceProfile
+    from .avatar import talking_head as run_talking_head
+
+    try:
+        root = _resolve_dir(directory)
+        load_dotenv(root / ".env")
+        ref = _resolve_file(reference, root)
+        profile = VoiceProfile.load(_work(root) / "voices" / f"{voice}.json")
+        out = Path(output)
+        out = out if out.is_absolute() else root / out
+        result = await anyio.to_thread.run_sync(
+            lambda: run_talking_head(
+                ref, script, profile, out,
+                work_dir=_work(root) / "avatars",
+                animate_seconds=animate_seconds, verbose=False,
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    return json.dumps({
+        "output": str(result.output),
+        "reference_kind": result.reference_kind,
+        "duration_s": round(result.duration, 2),
+        "voice": result.voice,
+        "steps": result.steps,
+        "next": "treat this as source footage — autocut, reframe and render it",
+    }, indent=2)
+
+
+# --- Getting media in and out of a hosted workspace --------------------------
+
+
+@server.tool(
+    description=(
+        "Pull a video, image or audio file into the workspace so it can be edited. "
+        "Takes a direct file link OR a YouTube / TikTok / Instagram / Vimeo / X "
+        "page URL (yt-dlp resolves the stream, capped at 1080p). Use it to grab "
+        "b-roll and reference footage, and as the way footage reaches a HOSTED "
+        "reelforge — a "
+        "phone has no shared filesystem with the server, so a share link "
+        "(Drive, Dropbox, iCloud, S3, any direct link) is the way in. Returns "
+        "the local name to use in later tools. Running locally over stdio you "
+        "usually do not need this: just point at the folder."
+    )
+)
+async def import_media(url: str, directory: str = ".", name: str | None = None) -> str:
+    import subprocess
+    import urllib.parse
+
+    from .ffmpeg import probe
+
+    try:
+        root = _resolve_dir(directory)
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"need an http(s) URL, got {parsed.scheme or 'no scheme'}")
+
+        # Derive a safe filename rather than trusting the URL's path: a remote
+        # string must never decide where a file lands on disk.
+        stem = Path(urllib.parse.unquote(parsed.path)).name or "import"
+        filename = name or stem
+        safe = "".join(c for c in filename if c.isalnum() or c in "._-") or "import"
+        if "." not in safe:
+            safe += ".mp4"
+        dest = _confine((root / safe).resolve())
+
+        # A page URL is not a file URL. YouTube, TikTok, Instagram and the rest
+        # serve HTML at the address you copy, so curl would faithfully save a
+        # web page named .mp4 — which only fails later, at render, where the
+        # cause is invisible. yt-dlp resolves the actual stream.
+        if _is_page_url(url):
+            if shutil.which("yt-dlp") is None:
+                raise RuntimeError(
+                    f"{parsed.netloc} serves a web page, not a video file. "
+                    "Install yt-dlp to pull from it: pip install yt-dlp"
+                )
+            result = await anyio.to_thread.run_sync(
+                lambda: subprocess.run(
+                    [
+                        "yt-dlp",
+                        # Cap at 1080p: a 4K source costs minutes of extra
+                        # download and encode for a 1080x1920 delivery target.
+                        "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+                        "--merge-output-format", "mp4",
+                        "--no-playlist", "-o", str(dest), url,
+                    ],
+                    capture_output=True, text=True,
+                )
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"yt-dlp failed: {(result.stderr or '').strip()[:300]}"
+                )
+        else:
+            result = await anyio.to_thread.run_sync(
+                lambda: subprocess.run(
+                    ["curl", "-fsSL", "--max-time", "1800", "-o", str(dest), url],
+                    capture_output=True, text=True,
+                )
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"download failed: {result.stderr[:200] or 'curl error'}"
+                )
+
+        # Verify it is real media before reporting success — an HTML error page
+        # saved as .mp4 only fails later, during render, where the cause is far
+        # harder to see.
+        info = await anyio.to_thread.run_sync(probe, dest)
+        if info.duration <= 0:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError("downloaded file is not playable media")
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    w, h = info.display_size
+    return json.dumps({
+        "imported": safe,
+        "path": str(dest),
+        "size": f"{w}x{h}",
+        "duration_s": round(info.duration, 2),
+        "has_audio": info.has_audio,
+        "size_mb": round(dest.stat().st_size / 1_048_576, 1),
+        "next": "probe_media or autocut it like any other source",
+    }, indent=2)
+
+
+@server.tool(
+    description=(
+        "List what is in the workspace, with a download link for each file when "
+        "the server is hosted. Use this to find footage you imported earlier, "
+        "and to get the finished render back out — on a hosted server the "
+        "output MP4 lives on the server, so this link is how you actually "
+        "receive it."
+    )
+)
+async def list_workspace(directory: str = ".", pattern: str = "*") -> str:
+    from .ffmpeg import probe
+
+    try:
+        root = _resolve_dir(directory)
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    base = os.environ.get("REELFORGE_PUBLIC_URL", "").rstrip("/")
+    files: list[dict[str, Any]] = []
+    for p in sorted(root.glob(pattern)):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        entry: dict[str, Any] = {
+            "name": p.name,
+            "size_mb": round(p.stat().st_size / 1_048_576, 2),
+        }
+        if p.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm", ".wav", ".mp3", ".m4a"):
+            try:
+                info = probe(p)
+                entry["duration_s"] = round(info.duration, 2)
+            except Exception:  # noqa: BLE001 — a listing should not fail on one bad file
+                entry["duration_s"] = None
+        if base and _WORKSPACE_ROOT is not None:
+            try:
+                rel = p.resolve().relative_to(_WORKSPACE_ROOT).as_posix()
+                entry["download"] = f"{base}/files/{rel}"
+            except ValueError:
+                pass
+        files.append(entry)
+
+    return json.dumps({
+        "workspace": str(root),
+        "files": files,
+        "note": (
+            None if base else
+            "set REELFORGE_PUBLIC_URL to the server's public address to get "
+            "download links for finished renders"
+        ),
+    }, indent=2)
+
+
+# --- Higgsfield talking heads (verified path) --------------------------------
+
+
+@server.tool(
+    description=(
+        "Plan and cost a talking head on Higgsfield BEFORE spending any credits. "
+        "Returns the exact generate_audio / generate_video calls to make, in "
+        "order, with a credit estimate. This is the VERIFIED path — photo + "
+        "cloned voice + script becomes a talking video in two calls, because "
+        "wan2_7 takes the audio as a reference and does motion and lipsync in "
+        "one generation. Show the user the cost before executing. Get voice_id "
+        "from Higgsfield list_voices (prefer voice_type 'element' — a cloned "
+        "voice) and image_media_id from show_medias."
+    )
+)
+async def plan_talking_head(
+    script: str,
+    voice_id: str,
+    image_media_id: str,
+    aspect_ratio: str = "9:16",
+    resolution: str = "720p",
+) -> str:
+    from .higgsfield import plan as build_plan
+
+    try:
+        p = build_plan(
+            script, voice_id, image_media_id,
+            aspect_ratio=aspect_ratio, resolution=resolution,
+        )
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    return json.dumps({
+        "summary": p.summary(),
+        "estimated_credits": round(p.est_credits, 2),
+        "segments": p.segments,
+        "calls": [
+            {"tool": c.tool, "params": c.params, "purpose": c.purpose,
+             "est_credits": round(c.est_credits, 2)}
+            for c in p.calls
+        ],
+        "notes": p.notes,
+        "how": (
+            "Run call 1 (generate_audio) via the Higgsfield MCP, wait with "
+            "jobs_wait, then substitute its job_id into call 2's "
+            "audio_references before running it. Finally pass the result URLs "
+            "to assemble_talking_head."
+        ),
+    }, indent=2, ensure_ascii=False)
+
+
+@server.tool(
+    description=(
+        "Download finished Higgsfield talking-head segments and assemble them "
+        "into an EDL. After this the talking head is ordinary footage — caption "
+        "it, grade it, cut other shots against it, lint and render it like any "
+        "other source. Verifies each download is real playable media rather "
+        "than an error page saved with a .mp4 name."
+    )
+)
+async def assemble_talking_head(
+    result_urls: list[str],
+    directory: str = ".",
+    output: str = "talking.edl.json",
+    platform: str = "reels",
+) -> str:
+    from .higgsfield import collect, to_edl
+
+    try:
+        root = _resolve_dir(directory)
+        segs = await anyio.to_thread.run_sync(
+            lambda: collect(result_urls, _work(root) / "avatars")
+        )
+        edl = to_edl(segs, root, platform=platform)
+        out = root / output
+        out.write_text(json.dumps(edl, indent=2) + "\n")
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+    from .ffmpeg import media_duration
+
+    return json.dumps({
+        "edl": str(out),
+        "segments": [str(s) for s in segs],
+        "total_duration_s": round(sum(media_duration(s) for s in segs), 2),
+        "next": "lint_edl then render — or write_edl first to cut it further",
+    }, indent=2)
+
+
 # --- Motion graphics --------------------------------------------------------
 
 
@@ -712,9 +1185,112 @@ async def render_overlay_slot(
     }, indent=2)
 
 
+def _auth_middleware(token: str):
+    """Reject requests without the shared bearer token.
+
+    A remote MCP server is a URL anyone can POST to, and these tools spend
+    credits, read files and run ffmpeg. The token is the whole boundary, so it
+    is required rather than optional — a server that starts without one and
+    quietly accepts everything is worse than one that refuses to start.
+
+    Compared with `secrets.compare_digest` so a wrong token takes the same time
+    to reject regardless of how much of it was right.
+    """
+    import secrets
+
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    class BearerAuth(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            # Health checks must not need a credential, or every uptime monitor
+            # and load balancer needs the secret just to ask if the port is up.
+            if request.url.path in ("/health", "/healthz"):
+                return JSONResponse({"ok": True, "service": "reelforge"})
+
+            header = request.headers.get("authorization", "")
+            offered = header[7:] if header.lower().startswith("bearer ") else ""
+            if not secrets.compare_digest(offered, token):
+                return JSONResponse(
+                    {"error": "unauthorized — send 'Authorization: Bearer <token>'"},
+                    status_code=401,
+                )
+            return await call_next(request)
+
+    return BearerAuth
+
+
 def main() -> None:
-    """Entry point for `reelforge-mcp`."""
-    server.run("stdio")
+    """Entry point for `reelforge-mcp`.
+
+    Two shapes, one server. Over stdio it is a local tool launched by Claude
+    Code or Claude Desktop, with the user's own filesystem as its scope. Over
+    HTTP it is a remote connector reachable from claude.ai — including phones —
+    and everything it can touch is confined to one workspace directory behind a
+    bearer token.
+    """
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(
+        prog="reelforge-mcp",
+        description="Serve reelforge's pipeline as MCP tools.",
+    )
+    parser.add_argument(
+        "--transport", default="stdio",
+        choices=["stdio", "streamable-http", "sse"],
+        help="stdio for a local client; streamable-http for a remote connector",
+    )
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--workspace",
+        help="directory all file access is confined to (HTTP transports). "
+             "Defaults to REELFORGE_WORKSPACE, then ./workspace",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "stdio":
+        server.run("stdio")
+        return
+
+    workspace = Path(
+        args.workspace or os.environ.get("REELFORGE_WORKSPACE") or "./workspace"
+    ).expanduser().resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+    set_workspace_root(workspace)
+
+    token = os.environ.get("REELFORGE_AUTH_TOKEN", "")
+    if not token:
+        raise SystemExit(
+            "REELFORGE_AUTH_TOKEN is required for network transports.\n"
+            "These tools spend credits and run ffmpeg — an open endpoint is not "
+            "a safe default.\n\n"
+            "  export REELFORGE_AUTH_TOKEN=\"$(python3 -c "
+            "'import secrets;print(secrets.token_urlsafe(32))')\""
+        )
+    if len(token) < 16:
+        raise SystemExit("REELFORGE_AUTH_TOKEN is too short — use 32+ characters")
+
+    app = server.streamable_http_app()
+
+    # Serve the workspace so finished renders can actually be retrieved. On a
+    # hosted server the output MP4 has nowhere else to go — without this the
+    # tool renders a file the user can never receive. Mounted BEFORE the auth
+    # middleware is added so it sits behind the same token.
+    from starlette.staticfiles import StaticFiles
+
+    app.router.mount(
+        "/files", StaticFiles(directory=str(workspace)), name="files"
+    )
+    app.add_middleware(_auth_middleware(token))
+
+    import uvicorn
+
+    print(f"reelforge {__version__} — {args.transport} on {args.host}:{args.port}")
+    print(f"  workspace  {workspace}  (all file access confined here)")
+    print(f"  auth       bearer token, {len(token)} chars")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

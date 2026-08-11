@@ -1,0 +1,60 @@
+# Deploy reelforge as a hosted connector on Render (render.com).
+#
+# This is the shape every connector in Claude's list already has — Higgsfield,
+# Canva, Blotato are all servers with public URLs. This makes reelforge one, so
+# it can be added once and used from web, desktop and phone alike.
+#
+# Steps:
+#   1. Push this repo to GitHub
+#   2. Render → New → Blueprint → point at this file
+#   3. Copy the generated REELFORGE_AUTH_TOKEN from the dashboard
+#   4. In Claude: + → Connectors → Add custom connector
+#        URL:    https://<your-service>.onrender.com/mcp
+#        Header: Authorization: Bearer <token>
+#
+# Fly.io, Railway and a plain VPS all work the same way — the Dockerfile is the
+# portable part, this file is just Render's way of describing it.
+
+services:
+  - type: web
+    name: reelforge
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+
+    # Video encoding is CPU-bound and memory-hungry. The free tier will
+    # technically boot and then die partway through the first render, which is
+    # a worse experience than not deploying at all.
+    plan: standard
+
+    healthCheckPath: /health
+
+    disk:
+      name: workspace
+      mountPath: /data
+      # Footage plus renders. Raise it if you keep sources around; without a
+      # disk at all, every deploy wipes the workspace.
+      sizeGB: 20
+
+    envVars:
+      # Generated once by Render and never printed in a build log. Read it from
+      # the dashboard — it is the credential Claude will send.
+      - key: REELFORGE_AUTH_TOKEN
+        generateValue: true
+
+      # Lets list_workspace hand back working download links for finished
+      # renders. Without it the render exists on the server and nowhere else.
+      - key: REELFORGE_PUBLIC_URL
+        fromService:
+          type: web
+          name: reelforge
+          property: host
+
+      - key: REELFORGE_WORKSPACE
+        value: /data/workspace
+
+      # Hosted transcription. The local Whisper backend is deliberately not
+      # installed in the image — a small instance would take longer to
+      # transcribe than to render.
+      - key: ELEVENLABS_API_KEY
+        sync: false

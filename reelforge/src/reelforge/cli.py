@@ -378,6 +378,105 @@ def cmd_clip(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preflight(args: argparse.Namespace) -> int:
+    from .avatar import preflight
+
+    root = Path(args.directory).resolve()
+    load_dotenv(root / ".env")
+    report = preflight()
+
+    print(f"  {'provider':<20}{'state':<12}detail")
+    exit_code = 0
+    for name, info in report.items():
+        if not info.get("configured"):
+            state = "not set"
+        elif info.get("ok"):
+            state = "ok"
+        else:
+            state = "FAILING"
+            exit_code = 1
+        print(f"  {name:<20}{state:<12}{info.get('detail', '')[:64]}")
+    return exit_code
+
+
+def cmd_voice(args: argparse.Namespace) -> int:
+    from .avatar import VoiceProfile, prepare_reference_audio
+    from .ffmpeg import media_duration
+
+    root = Path(args.directory).resolve()
+    src = Path(args.reference)
+    src = src if src.is_absolute() else root / src
+    if not src.exists():
+        return _fail(f"reference audio not found: {src}")
+
+    voices = _work(root) / "voices"
+    try:
+        prepared = prepare_reference_audio(src, voices / f"{args.name}.wav")
+    except Exception as e:  # noqa: BLE001
+        return _fail(str(e))
+
+    voice = VoiceProfile(
+        name=args.name, reference_audio=prepared, reference_text=args.text or ""
+    )
+    path = voice.save(voices / f"{args.name}.json")
+    print(f"{path}  ({media_duration(prepared):.1f}s reference)")
+    if not args.text:
+        print("  warning: no --text given. Supply the reference transcript "
+              "verbatim — cloning is in-context and is measurably worse without it.")
+    return 0
+
+
+def cmd_say(args: argparse.Namespace) -> int:
+    from .avatar import VoiceProfile, speak
+    from .ffmpeg import media_duration
+
+    root = Path(args.directory).resolve()
+    load_dotenv(root / ".env")
+    profile_path = _work(root) / "voices" / f"{args.voice}.json"
+    if not profile_path.exists():
+        return _fail(f"no voice named {args.voice!r} — create one with `reelforge voice`")
+
+    out = Path(args.output) if args.output else _work(root) / "voices" / f"{args.voice}_take.wav"
+    try:
+        speak(args.text, VoiceProfile.load(profile_path), out, model=args.model)
+    except Exception as e:  # noqa: BLE001
+        return _fail(str(e))
+    print(f"{out}  ({media_duration(out):.2f}s)")
+    return 0
+
+
+def cmd_talking_head(args: argparse.Namespace) -> int:
+    from .avatar import VoiceProfile, talking_head
+
+    root = Path(args.directory).resolve()
+    load_dotenv(root / ".env")
+    ref = Path(args.reference)
+    ref = ref if ref.is_absolute() else root / ref
+    profile_path = _work(root) / "voices" / f"{args.voice}.json"
+    if not profile_path.exists():
+        return _fail(f"no voice named {args.voice!r} — create one with `reelforge voice`")
+
+    script = args.script
+    if args.script_file:
+        script = Path(args.script_file).read_text().strip()
+    if not script:
+        return _fail("a script is required (positional, or --script-file)")
+
+    out = Path(args.output) if args.output else root / "talking.mp4"
+    try:
+        result = talking_head(
+            ref, script, VoiceProfile.load(profile_path), out,
+            work_dir=_work(root) / "avatars", animate_seconds=args.animate_seconds,
+        )
+    except Exception as e:  # noqa: BLE001
+        return _fail(str(e))
+
+    print(f"\n{result.output}  ({result.duration:.2f}s, from a {result.reference_kind})")
+    print("  edit it like any other footage: "
+          f"reelforge autocut {result.output.name}")
+    return 0
+
+
 def cmd_platforms(_: argparse.Namespace) -> int:
     print(f"{'key':<12}{'target':<24}{'canvas':<14}{'fps':<6}{'max':<8}sweet spot")
     for key, p in PLATFORMS.items():
@@ -563,6 +662,36 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-o", "--output")
     sp.add_argument("--no-zoom", action="store_true", help="hold the frame static")
     sp.set_defaults(func=cmd_clip)
+
+    sp = with_dir(sub.add_parser(
+        "preflight", help="test every avatar/generation credential"
+    ))
+    sp.set_defaults(func=cmd_preflight)
+
+    sp = with_dir(sub.add_parser("voice", help="register a voice for cloning"))
+    sp.add_argument("name")
+    sp.add_argument("reference", help="15-30s of clean speech")
+    sp.add_argument("--text", help="what the reference says, verbatim (strongly advised)")
+    sp.set_defaults(func=cmd_voice)
+
+    sp = with_dir(sub.add_parser("say", help="speak text in a cloned voice"))
+    sp.add_argument("voice")
+    sp.add_argument("text")
+    sp.add_argument("-o", "--output")
+    sp.add_argument("--model", default="s1")
+    sp.set_defaults(func=cmd_say)
+
+    sp = with_dir(sub.add_parser(
+        "talking-head", help="reference photo/video + script -> them saying it"
+    ))
+    sp.add_argument("reference")
+    sp.add_argument("script", nargs="?", default="")
+    sp.add_argument("--script-file")
+    sp.add_argument("-v", "--voice", required=True)
+    sp.add_argument("-o", "--output")
+    sp.add_argument("--animate-seconds", type=float, default=5.0,
+                    help="motion generated from a still before looping")
+    sp.set_defaults(func=cmd_talking_head)
 
     sub.add_parser("platforms", help="list targets, styles and presets").set_defaults(
         func=cmd_platforms

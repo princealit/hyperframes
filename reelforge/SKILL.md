@@ -76,6 +76,27 @@ one will run — with no API key the offline providers produce placeholders and
 robotic speech, which are right for building and timing a cut and wrong for
 anything anyone will watch. Never present placeholder output as finished.
 
+**Avatar route — a likeness saying new words.** A reference photo or clip plus a
+script becomes a video of that person speaking it, in a cloned voice.
+
+```bash
+reelforge preflight                          # do this FIRST
+reelforge voice <name> <reference.wav> --text "<verbatim transcript>"
+reelforge say <name> "<a test line>"         # check pronunciation before video
+reelforge talking-head <reference> "<script>" -v <name>
+```
+
+Run `preflight` before promising anything — this path has three independent
+providers and they all fail the same way at the point of use. Always generate
+and play back a test line with `say` before spending on video: pronunciation is
+the thing that goes wrong, and it is far cheaper to catch in audio.
+
+The reference transcript is not optional in practice. Cloning is in-context, so
+the transcript tells the model which sounds map to which graphemes; without it
+the clone is measurably worse.
+
+Output is ordinary footage. Edit it like any other source.
+
 Reach for the fast route when it genuinely fits. Transcribing a single clean
 take to remove three pauses is ceremony.
 
@@ -302,3 +323,8 @@ Append to `.reelforge/project.md`:
 - Presenting placeholder or `espeak` output as finished work. Say which
   provider ran.
 - Showing a render you have not run `review_cuts` on.
+- Generating a talking head before testing the voice on one line of audio.
+- Lipsyncing a still without animating it first — it produces a mouth moving
+  on a mannequin.
+- Cloning anyone's voice or likeness without the user confirming they have
+  the right to use it.

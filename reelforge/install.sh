@@ -64,9 +64,15 @@ BIN="$VENV/bin/reelforge-mcp"
 
 # --- 4. register with Claude Code -------------------------------------------
 if command -v claude >/dev/null 2>&1; then
+  # --scope user, emphatically. `claude mcp add` defaults to PROJECT scope,
+  # which registers the server only for the directory it was run from — so the
+  # connector exists in the reelforge checkout and is invisible in the folder
+  # where the user actually keeps their footage. That failure is silent: the
+  # tools simply are not there, with nothing to explain why.
+  claude mcp remove --scope user "$NAME" >/dev/null 2>&1 || true
   claude mcp remove "$NAME" >/dev/null 2>&1 || true
-  claude mcp add "$NAME" -- "$BIN"
-  ok "Claude Code connector '$NAME'"
+  claude mcp add --scope user "$NAME" -- "$BIN"
+  ok "Claude Code connector '$NAME' (available in every folder)"
 else
   warn "the 'claude' CLI is not installed — skipping Claude Code"
 fi

@@ -126,7 +126,30 @@ fi
 # Prove the public URL actually reaches this server before printing setup
 # instructions for it — a tunnel that resolves but does not route is otherwise
 # indistinguishable from success until Claude fails to connect.
-curl -fsS "$URL/health" >/dev/null 2>&1 || die "tunnel opened but does not reach the server"
+#
+# Polled, not checked once: cloudflared prints the hostname as soon as it has
+# been allocated, which is several seconds before edge routing is live. A single
+# immediate check therefore fails on a tunnel that is merely still starting.
+printf '  verifying'
+REACHED=""
+for _ in $(seq 1 30); do
+  if curl -fsS --max-time 5 "$URL/health" >/dev/null 2>&1; then
+    REACHED="yes"; break
+  fi
+  printf '.'
+  sleep 2
+done
+echo
+if [ -z "$REACHED" ]; then
+  echo
+  echo "  the tunnel opened at $URL but did not route within 60s."
+  echo "  the local server is fine — check it directly:"
+  echo "    curl http://127.0.0.1:$PORT/health"
+  echo
+  echo "  last few lines of the tunnel log:"
+  tail -5 /tmp/reelforge-tunnel.log | sed 's/^/    /'
+  die "tunnel did not become reachable"
+fi
 
 echo
 bold "ready — add this to Claude"

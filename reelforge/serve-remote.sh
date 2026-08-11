@@ -64,18 +64,64 @@ done
 curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 \
   || { tail -20 /tmp/reelforge-server.log; die "server did not start"; }
 
-bold "opening tunnel"
-cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate \
-  > /tmp/reelforge-tunnel.log 2>&1 &
-TUNNEL_PID=$!
+# --- named tunnel (stable URL) or quick tunnel (throwaway) ------------------
+# A quick tunnel mints a new random hostname on every launch, so the connector
+# in Claude breaks each time this restarts and the URL has to be repasted. With
+# a Cloudflare account a named tunnel keeps one hostname forever, which is the
+# difference between a demo and something usable daily.
+#
+#   TUNNEL_HOSTNAME=reelforge.yourdomain.com bash serve-remote.sh
+#
+# First run for a given hostname does the one-time setup:
+#   cloudflared tunnel login
+#   cloudflared tunnel create reelforge
+#   cloudflared tunnel route dns reelforge reelforge.yourdomain.com
 
-URL=""
-for _ in $(seq 1 45); do
-  URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/reelforge-tunnel.log 2>/dev/null | head -1 || true)"
-  [ -n "$URL" ] && break
-  sleep 1
-done
-[ -n "$URL" ] || { tail -20 /tmp/reelforge-tunnel.log; die "tunnel did not open"; }
+TUNNEL_NAME="${TUNNEL_NAME:-reelforge}"
+HOSTNAME_ARG="${TUNNEL_HOSTNAME:-}"
+
+if [ -n "$HOSTNAME_ARG" ]; then
+  if ! cloudflared tunnel list 2>/dev/null | grep -q "[[:space:]]$TUNNEL_NAME[[:space:]]"; then
+    cat <<EOF
+
+  A named tunnel called '$TUNNEL_NAME' does not exist yet. One-time setup:
+
+    cloudflared tunnel login
+    cloudflared tunnel create $TUNNEL_NAME
+    cloudflared tunnel route dns $TUNNEL_NAME $HOSTNAME_ARG
+
+  Then re-run this script. Free — a named tunnel costs nothing, and the
+  hostname never changes again.
+
+EOF
+    die "named tunnel '$TUNNEL_NAME' not found"
+  fi
+  bold "opening named tunnel -> https://$HOSTNAME_ARG"
+  cloudflared tunnel --no-autoupdate run \
+    --url "http://127.0.0.1:$PORT" "$TUNNEL_NAME" \
+    > /tmp/reelforge-tunnel.log 2>&1 &
+  TUNNEL_PID=$!
+  URL="https://$HOSTNAME_ARG"
+  # DNS for a fresh route can take a moment to propagate; poll rather than
+  # printing a URL that 404s for the first minute.
+  for _ in $(seq 1 45); do
+    curl -fsS "$URL/health" >/dev/null 2>&1 && break
+    sleep 2
+  done
+else
+  bold "opening quick tunnel (throwaway URL)"
+  cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate \
+    > /tmp/reelforge-tunnel.log 2>&1 &
+  TUNNEL_PID=$!
+
+  URL=""
+  for _ in $(seq 1 45); do
+    URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/reelforge-tunnel.log 2>/dev/null | head -1 || true)"
+    [ -n "$URL" ] && break
+    sleep 1
+  done
+  [ -n "$URL" ] || { tail -20 /tmp/reelforge-tunnel.log; die "tunnel did not open"; }
+fi
 
 # Prove the public URL actually reaches this server before printing setup
 # instructions for it — a tunnel that resolves but does not route is otherwise
